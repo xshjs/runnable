@@ -18,6 +18,7 @@ from tqdm.auto import tqdm
 import torch.distributed as dist
 from hydra import compose, initialize
 import argparse
+from omegaconf import open_dict
 from policy_evaluation.multistep_sequences import get_sequences
 from policy_evaluation.utils import get_default_beso_and_env, get_env_state_for_initial_condition, join_vis_lang
 from policy_models.utils.utils import get_last_checkpoint, get_all_checkpoints
@@ -25,6 +26,14 @@ from policy_models.rollout.rollout_video import RolloutVideo
 
 
 logger = logging.getLogger(__name__)
+
+
+def load_eval_sequences(eval_sequences_path, num_sequences=None):
+    with open(eval_sequences_path, "r") as handle:
+        sequences = json.load(handle)
+    if num_sequences is not None:
+        sequences = sequences[:num_sequences]
+    return sequences
 
 
 def get_video_tag(i):
@@ -62,7 +71,7 @@ def print_and_save(total_results, cfg, log_dir=None):
     if log_dir is None:
         log_dir = get_log_dir(cfg.train_folder)
 
-    sequences = get_sequences(cfg.num_sequences)
+    sequences = cfg.eval_sequences if "eval_sequences" in cfg and cfg.eval_sequences is not None else get_sequences(cfg.num_sequences)
 
     current_data = {}
     ranking = {}
@@ -240,6 +249,7 @@ def main(cfg):
         print(f"\n{'*'*80}")
         print(f"Processing checkpoint: {str(checkpoint)}")
         print(f"{'*'*80}")
+        device_id = device.index if device.type == "cuda" and device.index is not None else 0
         env, _, lang_embeddings = get_default_beso_and_env(
             cfg.train_folder,
             cfg.root_data_dir,
@@ -247,7 +257,7 @@ def main(cfg):
             env=env,
             lang_embeddings=lang_embeddings,
             eval_cfg_overwrite=cfg.eval_cfg_overwrite,
-            device_id=device.index,
+            device_id=device_id,
             cfg=cfg,
         )
 
@@ -311,6 +321,7 @@ if __name__ == "__main__":
     parser.add_argument("--t5_model_path", type=str, default="")
     parser.add_argument("--language_goal_path", type=str, default="")
     parser.add_argument("--calvin_abc_dir", type=str, default="")
+    parser.add_argument("--eval_sequences_path", type=str, default="")
     
     args = parser.parse_args()
     
@@ -326,4 +337,8 @@ if __name__ == "__main__":
         cfg.model.language_goal_path = args.language_goal_path
         print(f"[INFO] Overriding cfg.model.language_goal_path with args.language_goal_path: {cfg.model.language_goal_path}")
     cfg.root_data_dir = args.calvin_abc_dir
+    if args.eval_sequences_path:
+        with open_dict(cfg):
+            cfg.eval_sequences = load_eval_sequences(args.eval_sequences_path)
+            cfg.num_sequences = len(cfg.eval_sequences)
     main(cfg)

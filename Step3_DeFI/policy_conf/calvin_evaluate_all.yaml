@@ -14,7 +14,7 @@ eval_cfg_overwrite:
 
 # 评测参数
 ep_len: 720  # 360 for official, 720 following X-VLA
-num_sequences: 1000
+num_sequences: 5
 log_wandb: True
 
 # 模型采样参数

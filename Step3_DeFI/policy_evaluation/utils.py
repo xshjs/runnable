@@ -165,7 +165,7 @@ def get_default_beso_and_env(train_folder, dataset_path, checkpoint, env=None, l
     if device_id != 'cpu':
         device = torch.device(f"cuda:{device_id}")
     else:
-        device = 'cpu'
+        device = torch.device("cpu")
 
     if lang_embeddings is None:
         lang_embeddings = LangEmbeddings(dataset.abs_datasets_dir, lang_folder, device=device)
