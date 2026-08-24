@@ -3,15 +3,30 @@ from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 import functools
 from itertools import product
+import json
 import logging
 import multiprocessing
 from operator import add
+import os
+from pathlib import Path
 
 import numpy as np
 
 from policy_evaluation.utils import temp_seed
 
 logger = logging.getLogger(__name__)
+
+
+def _get_custom_eval_sequence_path() -> Path | None:
+    raw = os.environ.get("DEFI_CUSTOM_EVAL_SEQUENCE_PATH", "").strip()
+    return Path(raw) if raw else None
+
+
+def _get_custom_eval_sequence_len() -> int | None:
+    raw = os.environ.get("DEFI_CUSTOM_EVAL_SEQUENCE_LEN", "").strip()
+    if not raw:
+        return None
+    return int(raw)
 
 
 task_categories = {
@@ -350,6 +365,22 @@ def flatten(t):
 
 @functools.lru_cache
 def get_sequences(num_sequences=1000, num_workers=None):
+    custom_eval_sequence_path = _get_custom_eval_sequence_path()
+    custom_eval_sequence_len = _get_custom_eval_sequence_len()
+    if custom_eval_sequence_path is not None and custom_eval_sequence_path.exists():
+        with custom_eval_sequence_path.open("r") as handle:
+            results = json.load(handle)
+        logger.info(
+            "Done loading evaluation sequences from %s.",
+            custom_eval_sequence_path,
+        )
+        trimmed = []
+        for initial_state, sequence in results[:num_sequences]:
+            if custom_eval_sequence_len is not None:
+                sequence = sequence[:custom_eval_sequence_len]
+            trimmed.append((initial_state, sequence))
+        return trimmed
+
     possible_conditions = {
         "led": [0, 1],
         "lightbulb": [0, 1],

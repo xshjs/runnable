@@ -57,11 +57,19 @@ def get_log_dir(log_dir):
     return log_dir
 
 
-def count_success(results):
+def get_eval_horizon(cfg, sequences=None):
+    if getattr(cfg, "eval_horizon", None) is not None:
+        return int(cfg.eval_horizon)
+    if sequences:
+        return max(len(sequence) for _, sequence in sequences)
+    return 5
+
+
+def count_success(results, eval_horizon):
     count = Counter(results)
     step_success = []
-    for i in range(1, 6):
-        n_success = sum(count[j] for j in reversed(range(i, 6)))
+    for i in range(1, eval_horizon + 1):
+        n_success = sum(count[j] for j in reversed(range(i, eval_horizon + 1)))
         sr = n_success / len(results)
         step_success.append(sr)
     return step_success
@@ -75,12 +83,13 @@ def print_and_save(total_results, cfg, log_dir=None):
 
     current_data = {}
     ranking = {}
+    eval_horizon = get_eval_horizon(cfg, sequences)
     for checkpoint, results in total_results.items():
         epoch = checkpoint.stem
         print(f"Results for Epoch {epoch}:")
         avg_seq_len = np.mean(results)
         ranking[epoch] = avg_seq_len
-        chain_sr = {i + 1: sr for i, sr in enumerate(count_success(results))}
+        chain_sr = {i + 1: sr for i, sr in enumerate(count_success(results, eval_horizon))}
         print(f"Average successful sequence length: {avg_seq_len}")
         print("Success rates for i instructions in a row:")
         for i, sr in chain_sr.items():
@@ -152,9 +161,10 @@ def evaluate_policy(model, env, lang_embeddings, cfg,
         if record:
             rollout_video.write_to_tmp()
 
-        success_rates = count_success(results)
-        average_rate = sum(success_rates) / len(success_rates) * 5
-        description = " ".join([f"{i + 1}/5 : {v * 100:.1f}% |" for i, v in enumerate(success_rates)])
+        eval_horizon = get_eval_horizon(cfg, eval_sequences)
+        success_rates = count_success(results, eval_horizon)
+        average_rate = sum(success_rates) / len(success_rates) * eval_horizon
+        description = " ".join([f"{i + 1}/{eval_horizon} : {v * 100:.1f}% |" for i, v in enumerate(success_rates)])
         description += f" Average: {average_rate:.1f} |"
         eval_sequences.set_description(description)
 
@@ -322,6 +332,11 @@ if __name__ == "__main__":
     parser.add_argument("--language_goal_path", type=str, default="")
     parser.add_argument("--calvin_abc_dir", type=str, default="")
     parser.add_argument("--eval_sequences_path", type=str, default="")
+    parser.add_argument("--num_sequences", type=int, default=None)
+    parser.add_argument("--eval_horizon", type=int, default=None)
+    parser.add_argument("--use_default_sequences", action="store_true")
+    parser.add_argument("--default_sequences_path", type=str, default="")
+    parser.add_argument("--default_sequence_len", type=int, default=None)
     
     args = parser.parse_args()
     
@@ -337,8 +352,22 @@ if __name__ == "__main__":
         cfg.model.language_goal_path = args.language_goal_path
         print(f"[INFO] Overriding cfg.model.language_goal_path with args.language_goal_path: {cfg.model.language_goal_path}")
     cfg.root_data_dir = args.calvin_abc_dir
+    with open_dict(cfg):
+        if args.eval_horizon is not None:
+            cfg.eval_horizon = int(args.eval_horizon)
+        if args.num_sequences is not None:
+            cfg.num_sequences = int(args.num_sequences)
+    if args.default_sequences_path:
+        os.environ["DEFI_CUSTOM_EVAL_SEQUENCE_PATH"] = args.default_sequences_path
+    if args.default_sequence_len is not None:
+        os.environ["DEFI_CUSTOM_EVAL_SEQUENCE_LEN"] = str(int(args.default_sequence_len))
     if args.eval_sequences_path:
         with open_dict(cfg):
-            cfg.eval_sequences = load_eval_sequences(args.eval_sequences_path)
+            cfg.eval_sequences = load_eval_sequences(args.eval_sequences_path, num_sequences=args.num_sequences)
             cfg.num_sequences = len(cfg.eval_sequences)
+            if args.eval_horizon is None and cfg.eval_sequences:
+                cfg.eval_horizon = max(len(sequence) for _, sequence in cfg.eval_sequences)
+    elif args.use_default_sequences and args.eval_horizon is None:
+        with open_dict(cfg):
+            cfg.eval_horizon = args.default_sequence_len if args.default_sequence_len is not None else 5
     main(cfg)

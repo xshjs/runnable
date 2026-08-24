@@ -126,6 +126,54 @@ def process_depth(
     return {"depth_obs": seq_depth_obs_dict}
 
 
+def process_point_cloud(
+    episode: Dict[str, np.ndarray],
+    observation_space: DictConfig,
+    transforms: Dict,
+    seq_idx: int = 0,
+    window_size: int = 0,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    point_cloud_keys = observation_space.get("point_cloud_obs", [])
+    seq_point_cloud_dict = {}
+    for point_cloud_key in point_cloud_keys:
+        if point_cloud_key not in episode:
+            continue
+        point_cloud = episode[point_cloud_key]
+        if len(point_cloud.shape) != 4:
+            point_cloud = np.expand_dims(point_cloud, axis=0)
+        assert len(point_cloud.shape) == 4
+        if window_size == 0 and seq_idx == 0:
+            point_cloud_tensor = torch.from_numpy(point_cloud).float().permute(0, 3, 1, 2)
+        else:
+            point_cloud_tensor = torch.from_numpy(point_cloud[seq_idx : seq_idx + window_size]).float().permute(0, 3, 1, 2)
+        if point_cloud_key in transforms:
+            point_cloud_tensor = transforms[point_cloud_key](point_cloud_tensor)
+        seq_point_cloud_dict[point_cloud_key] = point_cloud_tensor
+    return {"point_cloud_obs": seq_point_cloud_dict}
+
+
+def process_camera(
+    episode: Dict[str, np.ndarray],
+    observation_space: DictConfig,
+    seq_idx: int = 0,
+    window_size: int = 0,
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    camera_obs_keys = observation_space.get("camera_obs", [])
+    seq_camera_obs_dict = {}
+    for camera_obs_key in camera_obs_keys:
+        if camera_obs_key not in episode:
+            continue
+        camera_obs = episode[camera_obs_key]
+        if window_size == 0 and seq_idx == 0:
+            camera_tensor = torch.from_numpy(camera_obs).float()
+        else:
+            camera_tensor = torch.from_numpy(camera_obs[seq_idx : seq_idx + window_size]).float()
+        if len(camera_tensor.shape) == 2:
+            camera_tensor = camera_tensor.unsqueeze(0)
+        seq_camera_obs_dict[camera_obs_key] = camera_tensor
+    return {"camera_obs": seq_camera_obs_dict}
+
+
 def process_actions(
     episode: Dict[str, np.ndarray],
     observation_space: DictConfig,

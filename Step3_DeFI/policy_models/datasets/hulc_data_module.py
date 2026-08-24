@@ -11,7 +11,17 @@ from torch.utils.data import DataLoader
 from torch.utils.data import DataLoader, random_split, Subset
 import torch
 import torchvision
-import pytorch_lightning as pl
+try:
+    import pytorch_lightning as pl
+except Exception:  # pragma: no cover - optional dependency fallback
+    class _LightningDataModule:
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    class _PLNamespace:
+        LightningDataModule = _LightningDataModule
+
+    pl = _PLNamespace()
 
 import policy_models
 from policy_models.datasets.utils.episode_utils import load_dataset_statistics
@@ -30,6 +40,7 @@ class HulcDataModule(pl.LightningDataModule):
         num_workers: int = 8,
         transforms: DictConfig = DEFAULT_TRANSFORM,
         shuffle_val: bool = False,
+        allow_auto_download_debug: bool = False,
         **kwargs: Dict,
     ):
         super().__init__()
@@ -48,6 +59,7 @@ class HulcDataModule(pl.LightningDataModule):
         self.modalities: List[str] = []
         self.transforms = transforms
         self.use_shm = False
+        self.allow_auto_download_debug = allow_auto_download_debug
 
     def prepare_data(self, *args, **kwargs):
         # check if files already exist
@@ -55,14 +67,13 @@ class HulcDataModule(pl.LightningDataModule):
 
         # download and unpack images
         if not dataset_exist:
-            if "CI" not in os.environ:
-                print(f"No dataset found in {self.training_dir}.")
-                print("For information how to download to full CALVIN dataset, please visit")
-                print("https://github.com/mees/calvin/tree/main/dataset")
-                print("Do you wish to download small debug dataset to continue training?")
-                s = input("YES / no")
-                if s == "no":
-                    exit()
+            allow_debug_download = self.allow_auto_download_debug or os.environ.get("DEFI_ALLOW_DEBUG_DATASET_DOWNLOAD") == "1"
+            if not allow_debug_download:
+                raise FileNotFoundError(
+                    f"No dataset found in {self.training_dir}. "
+                    "Expected real dataset under <root_data_dir>/training and <root_data_dir>/validation. "
+                    "If you intentionally want the tiny debug dataset, set DEFI_ALLOW_DEBUG_DATASET_DOWNLOAD=1."
+                )
             logger.info(f"downloading dataset to {self.training_dir} and {self.val_dir}")
             torchvision.datasets.utils.download_and_extract_archive(ONE_EP_DATASET_URL, self.training_dir)
             torchvision.datasets.utils.download_and_extract_archive(ONE_EP_DATASET_URL, self.val_dir)
@@ -114,17 +125,19 @@ class HulcDataModule(pl.LightningDataModule):
                 self.modalities.append(key)
 
     def train_dataloader(self):
-        return {
-            key: DataLoader(
-                dataset,
+        loaders = {}
+        for key, dataset in self.train_datasets.items():
+            kwargs = dict(
+                dataset=dataset,
                 batch_size=dataset.batch_size,
                 num_workers=dataset.num_workers,
                 pin_memory=True,
                 shuffle=True,
-                prefetch_factor=2,
             )
-            for key, dataset in self.train_datasets.items()
-        }
+            if int(dataset.num_workers) > 0:
+                kwargs["prefetch_factor"] = 2
+            loaders[key] = DataLoader(**kwargs)
+        return loaders
 
     def val_dataloader(self):
         return {

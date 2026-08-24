@@ -1,37 +1,184 @@
 import logging
 from typing import Dict, Optional, Tuple
 from functools import partial
+import os
+
+try:
+    import huggingface_hub as _hf_hub
+
+    if not hasattr(_hf_hub, "cached_download") and hasattr(_hf_hub, "hf_hub_download"):
+        def _cached_download(*args, **kwargs):
+            return _hf_hub.hf_hub_download(*args, **kwargs)
+
+        _hf_hub.cached_download = _cached_download
+except Exception:
+    pass
+
+try:
+    import transformers.utils as _tf_utils
+
+    if not hasattr(_tf_utils, "FLAX_WEIGHTS_NAME"):
+        _tf_utils.FLAX_WEIGHTS_NAME = "flax_model.msgpack"
+    if hasattr(_tf_utils, "check_torch_load_is_safe"):
+        _tf_utils.check_torch_load_is_safe = lambda: None
+except Exception:
+    pass
+
+try:
+    import inspect as _inspect
+    import triton as _triton
+
+    if hasattr(_triton, "autotune"):
+        _autotune_sig = _inspect.signature(_triton.autotune)
+        if "use_cuda_graph" not in _autotune_sig.parameters:
+            _orig_autotune = _triton.autotune
+
+            def _compat_autotune(*args, **kwargs):
+                kwargs.pop("use_cuda_graph", None)
+                return _orig_autotune(*args, **kwargs)
+
+            _triton.autotune = _compat_autotune
+except Exception:
+    pass
+
+import torch
 from torch import einsum, nn
 from einops import rearrange, repeat
 from omegaconf import DictConfig, OmegaConf
-import pytorch_lightning as pl
-from pytorch_lightning.utilities import rank_zero_only
+try:
+    import pytorch_lightning as pl
+    from pytorch_lightning.utilities import rank_zero_only
+except Exception:
+    class _LightningModule(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+        def save_hyperparameters(self, *args, **kwargs):
+            return None
+
+        def log(self, *args, **kwargs):
+            return None
+
+    class _PLNamespace:
+        LightningModule = _LightningModule
+
+    pl = _PLNamespace()
+
+    def rank_zero_only(fn):
+        return fn
 import einops
 from policy_models.edm_diffusion.score_wrappers import GCDenoiser
 import omegaconf
 import hydra
 from pathlib import Path
 from policy_models.module.clip_lang_encoder import LangClip
-from policy_models.edm_diffusion.gc_sampling import *
 from policy_models.utils.lr_schedulers.tri_stage_scheduler import TriStageLRScheduler
 from policy_models.module.Video_Former import Video_Former_3D
-from diffusers import StableVideoDiffusionPipeline
-from transformers import AutoTokenizer, CLIPTextModelWithProjection
-from policy_models.m_former_univla.latent_motion_tokenizer_univla import UncontrolledDINOLatentActionModel
-# 如果正常的1步diffusion过程，用下面这个
-from policy_models.module.diffusion_extract import Diffusion_feature_extractor
-# 如果想输出不同步数的SVD预测的video，用下面这个
-from policy_models.module.diffusion_extract_outvideo import Diffusion_feature_extractor as Diffusion_feature_extractor_outvideo
 
 
 logger = logging.getLogger(__name__)
 
+_GC_SAMPLING_IMPORTED = False
+_GC_SAMPLING_IMPORT_ERROR = None
 
-def load_primary_models(pretrained_model_path, eval=False):
-    if eval:
-        pipeline = StableVideoDiffusionPipeline.from_pretrained(pretrained_model_path, torch_dtype=torch.float16)
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _first_existing_path(*candidates: str) -> str:
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = str(candidate).strip()
+        if not candidate or candidate in {".", ".."}:
+            continue
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+def _resolve_model_path(user_value: str, *, env_key: str, fallback_candidates: list[str], label: str) -> str:
+    chosen = _first_existing_path(
+        user_value,
+        os.environ.get(env_key, ""),
+        *fallback_candidates,
+    )
+    if not chosen:
+        raise FileNotFoundError(
+            f"Could not resolve {label}. got={user_value!r} env[{env_key}]={os.environ.get(env_key, '')!r}"
+        )
+    print(f"[VPP_PATH] {label} -> {chosen}")
+    return chosen
+
+
+def _default_ckpt_candidates(*relative_paths: str) -> list[str]:
+    root = _repo_root()
+    candidates = []
+    for rel in relative_paths:
+        candidates.append(str(root / rel))
+    return candidates
+
+
+def _ensure_gc_sampling_imported():
+    global _GC_SAMPLING_IMPORTED, _GC_SAMPLING_IMPORT_ERROR
+    if _GC_SAMPLING_IMPORTED:
+        return
+    try:
+        from policy_models.edm_diffusion.gc_sampling import (
+            sample_lms,
+            sample_heun,
+            sample_euler,
+            sample_dpm_2_ancestral,
+            sample_euler_ancestral,
+            sample_dpm_2,
+            sample_dpm_adaptive,
+            sample_dpm_fast,
+            sample_dpmpp_2s_ancestral,
+            sample_dpmpp_2m,
+            sample_dpmpp_sde,
+            sample_ddim,
+            sample_dpmpp_2s,
+            sample_dpmpp_2_with_lms,
+            get_sigmas_karras,
+            get_sigmas_exponential,
+            get_sigmas_vp,
+            get_sigmas_linear,
+            cosine_beta_schedule,
+            get_sigmas_ve,
+            get_iddpm_sigmas,
+            utils,
+            math,
+        )
+        globals().update(locals())
+        _GC_SAMPLING_IMPORTED = True
+    except Exception as exc:
+        _GC_SAMPLING_IMPORT_ERROR = exc
+        raise
+
+
+def load_primary_models(pretrained_model_path, eval=False, device=None):
+    from diffusers import StableVideoDiffusionPipeline
+
+    use_fp16 = eval
+    if device is not None:
+        device_str = str(device)
+        if device_str == "cpu" or (device_str.startswith("cuda") and not torch.cuda.is_available()):
+            use_fp16 = False
+    elif not torch.cuda.is_available():
+        use_fp16 = False
+
+    if use_fp16:
+        pipeline = StableVideoDiffusionPipeline.from_pretrained(
+            pretrained_model_path,
+            torch_dtype=torch.float16,
+            local_files_only=True,
+        )
     else:
-        pipeline = StableVideoDiffusionPipeline.from_pretrained(pretrained_model_path)
+        pipeline = StableVideoDiffusionPipeline.from_pretrained(
+            pretrained_model_path,
+            local_files_only=True,
+        )
     return pipeline, None, pipeline.feature_extractor, pipeline.scheduler, pipeline.video_processor, \
         pipeline.image_encoder, pipeline.vae, pipeline.unet
 
@@ -76,6 +223,12 @@ class VPP_Policy(pl.LightningModule):
             obs_seq_len: int = 1,
             action_dim: int = 7,
             action_seq_len: int = 10,
+            action_head_type: str = "diffusion",
+            n_trans_bins: int = 21,
+            n_rot_bins: int = 21,
+            first_steps_weight: float = 1.0,
+            first_steps_count: int = 0,
+            **unused_kwargs,
     ):
         super(VPP_Policy, self).__init__()
         self.latent_dim = latent_dim
@@ -85,6 +238,11 @@ class VPP_Policy(pl.LightningModule):
         self.language_goal_path = language_goal_path
         self.act_window_size = act_window_size
         self.action_dim = action_dim
+        self.action_head_type = action_head_type
+        self.n_trans_bins = n_trans_bins
+        self.n_rot_bins = n_rot_bins
+        self.first_steps_weight = first_steps_weight
+        self.first_steps_count = first_steps_count
         self.timestep = timestep  # 20, 正确的改去噪步骤输出视频从这里改
         self.extract_layer_idx = extract_layer_idx  # 1
         self.use_Former = use_Former  # '3d'
@@ -122,6 +280,32 @@ class VPP_Policy(pl.LightningModule):
 
         self.use_univla = True 
 
+        pretrained_model_path = _resolve_model_path(
+            pretrained_model_path,
+            env_key="DEFI_VIDEO_MODEL_PATH",
+            fallback_candidates=_default_ckpt_candidates("ckpts/_hf_defi/step1_gfdm"),
+            label="pretrained_model_path",
+        )
+        text_encoder_path = _resolve_model_path(
+            text_encoder_path,
+            env_key="DEFI_CLIP_MODEL_PATH",
+            fallback_candidates=_default_ckpt_candidates("ckpts/openai_clip_vit_base_patch32"),
+            label="text_encoder_path",
+        )
+        t5_model_path = _resolve_model_path(
+            t5_model_path,
+            env_key="DEFI_T5_MODEL_PATH",
+            fallback_candidates=_default_ckpt_candidates("ckpts/t5_base"),
+            label="t5_model_path",
+        )
+        self.t5_model_path = t5_model_path
+        self.language_goal_path = _resolve_model_path(
+            self.language_goal_path,
+            env_key="DEFI_LANGUAGE_GOAL_PATH",
+            fallback_candidates=_default_ckpt_candidates("ckpts/ViT-B-32.pt"),
+            label="language_goal_path",
+        )
+
         # goal encoders
         # self.language_goal = LangClip(model_name='ViT-B/32').to(self.device)
         self.language_goal = LangClip(
@@ -129,10 +313,19 @@ class VPP_Policy(pl.LightningModule):
                 self.device)
 
         pipeline, tokenizer, feature_extractor, train_scheduler, vae_processor, text_encoder, vae, unet = load_primary_models(
-            pretrained_model_path , eval = True)
+            pretrained_model_path , eval = True, device=self.device)
 
-        text_encoder = CLIPTextModelWithProjection.from_pretrained(text_encoder_path)
-        tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, use_fast=False)
+        from transformers import AutoTokenizer, CLIPTextModelWithProjection
+
+        text_encoder = CLIPTextModelWithProjection.from_pretrained(
+            text_encoder_path,
+            local_files_only=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            text_encoder_path,
+            use_fast=False,
+            local_files_only=True,
+        )
 
         text_encoder = text_encoder.to(self.device).eval()
 
@@ -148,6 +341,8 @@ class VPP_Policy(pl.LightningModule):
 
         pipeline = pipeline.to(self.device)
         pipeline.unet.eval()
+
+        from policy_models.module.diffusion_extract import Diffusion_feature_extractor
 
         self.TVP_encoder = Diffusion_feature_extractor(pipeline=pipeline,
                                                         tokenizer=tokenizer,
@@ -166,6 +361,8 @@ class VPP_Policy(pl.LightningModule):
 
         # policy network
         if self.use_univla:
+            from policy_models.m_former_univla.latent_motion_tokenizer_univla import UncontrolledDINOLatentActionModel
+
             self.model = GCDenoiser(action_dim = action_dim,
                                     obs_dim=latent_dim,
                                     goal_dim=512,
@@ -197,6 +394,14 @@ class VPP_Policy(pl.LightningModule):
         self.latent_goal = None
         self.plan = None
         self.use_text_not_embedding = use_text_not_embedding  # True
+        self.action_intent_dim = 16 * action_dim
+        self.action_intent_proj = nn.Sequential(
+            nn.LayerNorm(self.action_intent_dim),
+            nn.Linear(self.action_intent_dim, 512),
+            nn.GELU(),
+            nn.Linear(512, 512),
+        ).to(self.device)
+        self.override_action_intent = None
 
         # for clip loss ground truth plot
         self.ema_callback_idx = None
@@ -230,6 +435,8 @@ class VPP_Policy(pl.LightningModule):
                 {"params": self.goal_emb.parameters(), 
                 "weight_decay": self.optimizer_config.transformer_weight_decay},
                 {"params": [self.time_pos_emb], 
+                "weight_decay": self.optimizer_config.transformer_weight_decay},
+                {"params": self.action_intent_proj.parameters(),
                 "weight_decay": self.optimizer_config.transformer_weight_decay},
             ]
 
@@ -313,6 +520,7 @@ class VPP_Policy(pl.LightningModule):
             latent_goal = self.language_goal(dataset_batch["lang_text"]).to(rgb_static.dtype)  # torch.Size([28, 1, 512])
         else:
             latent_goal = self.language_goal(dataset_batch["lang"]).to(rgb_static.dtype)
+        latent_goal = self._condition_latent_goal_with_action_intent(latent_goal, dataset_batch)
 
         language = dataset_batch["lang_text"]
 
@@ -377,15 +585,18 @@ class VPP_Policy(pl.LightningModule):
             latent_goal: torch.Tensor,
             actions: torch.Tensor,
             latent_motion_tokens_up: torch.Tensor = None,
+            action_intent_cond: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Computes the score matching loss given the perceptual embedding, latent goal, and desired actions.
         """
+        _ensure_gc_sampling_imported()
         self.model.train()
         sigmas = self.make_sample_density()(shape=(len(actions),), device=self.device).to(self.device)
         noise = torch.randn_like(actions).to(self.device)  # torch.Size([28, 10, 7])
         loss, _ = self.model.loss(perceptual_emb, actions, latent_goal, noise, sigmas,
-                                  latent_motion_tokens_up)
+                                  latent_motion_tokens_up,
+                                  action_intent_cond=action_intent_cond)
         return loss, sigmas, noise
 
     def denoise_actions(  # type: ignore
@@ -394,6 +605,7 @@ class VPP_Policy(pl.LightningModule):
             perceptual_emb: torch.Tensor,
             latent_goal: torch.Tensor,
             latent_motion_tokens_up: torch.Tensor = None,
+            action_intent_cond: torch.Tensor = None,
             inference: Optional[bool] = False,
             extra_args={}
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -415,6 +627,9 @@ class VPP_Policy(pl.LightningModule):
         x = torch.randn((len(latent_goal), self.act_window_size, self.action_dim), device=self.device) * self.sigma_max
         # torch.Size([28, 10, 7])
 
+        if action_intent_cond is not None:
+            extra_args = dict(extra_args)
+            extra_args["action_intent_cond"] = action_intent_cond
         actions = self.sample_loop(sigmas, latent_motion_tokens_up,
                                    x, input_state, latent_goal, latent_plan, self.sampler_type, extra_args)
 
@@ -425,6 +640,7 @@ class VPP_Policy(pl.LightningModule):
         Generate a sample density function based on the desired type for training the model
         We mostly use log-logistic as it has no additional hyperparameters to tune.
         """
+        _ensure_gc_sampling_imported()
         sd_config = []
         if self.sigma_sample_density_type == 'lognormal':
             loc = self.sigma_sample_density_mean  # if 'mean' in sd_config else sd_config['loc']
@@ -477,12 +693,13 @@ class VPP_Policy(pl.LightningModule):
         """
         Main method to generate samples depending on the chosen sampler type. DDIM is the default as it works well in all settings.
         """
+        _ensure_gc_sampling_imported()
         s_churn = extra_args['s_churn'] if 's_churn' in extra_args else 0
         s_min = extra_args['s_min'] if 's_min' in extra_args else 0
         use_scaler = extra_args['use_scaler'] if 'use_scaler' in extra_args else False
         keys = ['s_churn', 'keep_last_actions']
         if bool(extra_args):
-            reduced_args = {x: extra_args[x] for x in keys}
+            reduced_args = {x: extra_args[x] for x in keys if x in extra_args}
         else:
             reduced_args = {}
         if use_scaler:
@@ -529,6 +746,7 @@ class VPP_Policy(pl.LightningModule):
         """
         Get the noise schedule for the sampling steps. Describes the distribution over the noise levels from sigma_min to sigma_max.
         """
+        _ensure_gc_sampling_imported()
         if noise_schedule_type == 'karras':
             return get_sigmas_karras(n_sampling_steps, self.sigma_min, self.sigma_max, 7,
                                      self.device)
@@ -553,6 +771,51 @@ class VPP_Policy(pl.LightningModule):
         self.plan = None
         self.latent_goal = None
         self.rollout_step_counter = 0
+        self.override_action_intent = None
+
+    def _condition_latent_goal_with_action_intent(self, latent_goal, goal):
+        action_intent = None
+        if isinstance(goal, dict):
+            action_intent = goal.get("action_intent")
+        if action_intent is None:
+            action_intent = getattr(self, "override_action_intent", None)
+        if action_intent is None:
+            return latent_goal
+        if not torch.is_tensor(action_intent):
+            action_intent = torch.as_tensor(action_intent, dtype=latent_goal.dtype, device=latent_goal.device)
+        else:
+            action_intent = action_intent.to(device=latent_goal.device, dtype=latent_goal.dtype)
+        if action_intent.dim() == 2:
+            action_intent = action_intent.unsqueeze(0)
+        action_intent = action_intent.reshape(action_intent.shape[0], -1)
+        if action_intent.shape[-1] != self.action_intent_dim:
+            raise ValueError(f"expected flattened action_intent dim {self.action_intent_dim}, got {action_intent.shape[-1]}")
+        action_intent = self.action_intent_proj(action_intent).unsqueeze(1)
+        if action_intent.shape[0] == 1 and latent_goal.shape[0] != 1:
+            action_intent = action_intent.expand(latent_goal.shape[0], -1, -1)
+        elif action_intent.shape[0] != latent_goal.shape[0]:
+            raise ValueError(f"expected action_intent batch {latent_goal.shape[0]}, got {action_intent.shape[0]}")
+        return latent_goal + action_intent
+
+    def _project_action_intent_condition(self, goal, device, dtype):
+        action_intent = None
+        if isinstance(goal, dict):
+            action_intent = goal.get("action_intent")
+        if action_intent is None:
+            action_intent = getattr(self, "override_action_intent", None)
+        if action_intent is None:
+            return None
+        if not torch.is_tensor(action_intent):
+            action_intent = torch.as_tensor(action_intent, dtype=dtype, device=device)
+        else:
+            action_intent = action_intent.to(device=device, dtype=dtype)
+        if action_intent.dim() == 2:
+            action_intent = action_intent.unsqueeze(0)
+        action_intent = action_intent.reshape(action_intent.shape[0], -1)
+        if action_intent.shape[-1] != self.action_intent_dim:
+            raise ValueError(f"expected flattened action_intent dim {self.action_intent_dim}, got {action_intent.shape[-1]}")
+        action_intent = self.action_intent_proj(action_intent).unsqueeze(1)
+        return action_intent
 
     def forward(self,batch):  # This is used when training the model.
         return self.training_step(batch)
@@ -568,6 +831,8 @@ class VPP_Policy(pl.LightningModule):
             else:
                 latent_goal = self.language_goal(goal["lang"]).unsqueeze(0).to(torch.float32).to(
                     obs["rgb_obs"]['rgb_static'].device)
+            latent_goal = self._condition_latent_goal_with_action_intent(latent_goal, goal)
+            action_intent_cond = self._project_action_intent_condition(goal, latent_goal.device, latent_goal.dtype)
 
         rgb_static = obs["rgb_obs"]['rgb_static']  # torch.Size([28, 1, 3, 256, 256])
         rgb_gripper = obs["rgb_obs"]['rgb_gripper']  # torch.Size([28, 1, 3, 256, 256])
@@ -643,6 +908,7 @@ class VPP_Policy(pl.LightningModule):
                 perceptual_emb,
                 latent_goal,
                 latent_motion_tokens_up,
+                action_intent_cond=action_intent_cond,
                 inference=True,
             )
         return act_seq  # torch.Size([28, 10, 7])

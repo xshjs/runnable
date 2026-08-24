@@ -11,7 +11,17 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 from omegaconf import DictConfig
-from pytorch_lightning import Callback, LightningModule, Trainer
+try:
+    from pytorch_lightning import Callback, LightningModule, Trainer
+except Exception:  # pragma: no cover - optional dependency fallback
+    class Callback:
+        pass
+
+    class LightningModule:
+        pass
+
+    class Trainer:
+        pass
 from tqdm import tqdm
 
 from policy_models.datasets.shm_dataset import ShmDataset

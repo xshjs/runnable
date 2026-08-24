@@ -1,24 +1,30 @@
 import logging
+import hashlib
 from pathlib import Path
 from typing import Dict, Tuple, Union
 
 import numpy as np
 from omegaconf import DictConfig
-import pyhash
 import torch
 from torch.utils.data import Dataset
 
 from policy_models.datasets.utils.episode_utils import (
     get_state_info_dict,
     process_actions,
+    process_camera,
     process_depth,
     process_language,
+    process_point_cloud,
     process_rgb,
     process_state,
 )
 
-hasher = pyhash.fnv1_32()
 logger = logging.getLogger(__name__)
+
+
+def stable_hash_int(value: str) -> int:
+    digest = hashlib.blake2s(value.encode("utf-8"), digest_size=4).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
 
 
 def get_validation_window_size(idx: int, min_window_size: int, max_window_size: int) -> int:
@@ -34,7 +40,7 @@ def get_validation_window_size(idx: int, min_window_size: int, max_window_size: 
         Window size computed with hash function.
     """
     window_range = max_window_size - min_window_size + 1
-    return min_window_size + hasher(str(idx)) % window_range
+    return min_window_size + stable_hash_int(str(idx)) % window_range
 
 
 class BaseDataset(Dataset):
@@ -144,10 +150,57 @@ class BaseDataset(Dataset):
         seq_state_obs = process_state(episode, self.observation_space, self.transforms, self.proprio_state)
         seq_rgb_obs = process_rgb(episode, self.observation_space, self.transforms)
         seq_acts = process_actions(episode, self.observation_space, self.transforms)
+        seq_depth_obs = process_depth(episode, self.observation_space, self.transforms)
+        seq_point_cloud_obs = process_point_cloud(episode, self.observation_space, self.transforms)
+        seq_camera_obs = process_camera(episode, self.observation_space)
         info = get_state_info_dict(episode)
         seq_lang = process_language(episode, self.transforms, self.with_lang)
         info = self._add_language_info(info, idx)
-        seq_dict = {**seq_state_obs, **seq_rgb_obs, **seq_acts, **info, **seq_lang}  # type:ignore
+        seq_dict = {
+            **seq_state_obs,
+            **seq_rgb_obs,
+            **seq_depth_obs,
+            **seq_point_cloud_obs,
+            **seq_camera_obs,
+            **seq_acts,
+            **info,
+            **seq_lang,
+        }  # type:ignore
+        if "stage" in episode:
+            seq_dict["stage"] = torch.from_numpy(episode["stage"]).long()
+        for extra_key in (
+            "trans_action_indicies",
+            "rot_grip_action_indicies",
+            "ignore_collisions",
+            "gripper_pose",
+            "rlbench_target_index",
+            "target_delta_xyz",
+            "target_gripper",
+            "target_collision",
+            "future_offset",
+        ):
+            if extra_key in episode:
+                tensor = torch.from_numpy(episode[extra_key])
+                if tensor.dtype in (torch.int32, torch.int64, torch.uint8, torch.int16):
+                    seq_dict[extra_key] = tensor.long()
+                else:
+                    seq_dict[extra_key] = tensor.float()
+        future_keys = [k for k in episode.keys() if k.startswith("future_")]
+        if future_keys:
+            future_episode = {}
+            for key in future_keys:
+                base_key = key[len("future_") :]
+                future_episode[base_key] = episode[key]
+            future_rgb_obs = process_rgb(future_episode, self.observation_space, self.transforms)["rgb_obs"]
+            future_depth_obs = process_depth(future_episode, self.observation_space, self.transforms)["depth_obs"]
+            future_point_cloud_obs = process_point_cloud(future_episode, self.observation_space, self.transforms)["point_cloud_obs"]
+            future_camera_obs = process_camera(future_episode, self.observation_space)["camera_obs"]
+            future_state = process_state(future_episode, self.observation_space, self.transforms, self.proprio_state)
+            seq_dict["future_rgb_obs"] = future_rgb_obs
+            seq_dict["future_depth_obs"] = future_depth_obs
+            seq_dict["future_point_cloud_obs"] = future_point_cloud_obs
+            seq_dict["future_camera_obs"] = future_camera_obs
+            seq_dict["future_robot_obs"] = future_state["robot_obs"]
         seq_dict["idx"] = idx  # type:ignore
         return seq_dict
 
@@ -223,6 +276,10 @@ class BaseDataset(Dataset):
         seq.update({"robot_obs": self._pad_with_repetition(seq["robot_obs"], pad_size)})
         seq.update({"rgb_obs": {k: self._pad_with_repetition(v, pad_size) for k, v in seq["rgb_obs"].items()}})
         seq.update({"depth_obs": {k: self._pad_with_repetition(v, pad_size) for k, v in seq["depth_obs"].items()}})
+        if "point_cloud_obs" in seq:
+            seq.update({"point_cloud_obs": {k: self._pad_with_repetition(v, pad_size) for k, v in seq["point_cloud_obs"].items()}})
+        if "camera_obs" in seq:
+            seq.update({"camera_obs": {k: self._pad_with_repetition(v, pad_size) for k, v in seq["camera_obs"].items()}})
         #  todo: find better way of distinguishing rk and play action spaces
         if not self.relative_actions:
             # repeat action for world coordinates action space
@@ -237,6 +294,8 @@ class BaseDataset(Dataset):
                 dim=-1,
             )
             seq.update({"actions": seq_acts})
+        if "stage" in seq:
+            seq.update({"stage": self._pad_with_repetition(seq["stage"], pad_size)})
         seq.update({"state_info": {k: self._pad_with_repetition(v, pad_size) for k, v in seq["state_info"].items()}})
         return seq
 
