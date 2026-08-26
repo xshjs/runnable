@@ -14,6 +14,7 @@ NUM_GPUS="${NUM_GPUS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-28}"
 MAX_EPOCHS="${MAX_EPOCHS:-12}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
+SAVE_EVERY="${SAVE_EVERY:-2000}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 if [[ -z "${ROOT_DATA_DIR}" || -z "${VIDEO_MODEL_PATH}" || -z "${TEXT_ENCODER_PATH}" || -z "${T5_MODEL_PATH}" || -z "${LANGUAGE_GOAL_PATH}" ]]; then
@@ -69,4 +70,5 @@ fi
   --batch_size "${BATCH_SIZE}" \
   --max_epochs "${MAX_EPOCHS}" \
   --num_workers "${NUM_WORKERS}" \
+  --save_every "${SAVE_EVERY}" \
   "${TOKEN_ARGS[@]}"

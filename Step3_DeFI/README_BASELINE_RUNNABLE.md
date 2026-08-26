@@ -116,6 +116,66 @@ Actual training entrypoint in this repo:
 - `Step3_DeFI/scripts/train_calvin.py`
 - `Step3_DeFI/scripts/train_calvin_real_robot.sh`
 
+### LeRobot V30 real-robot conversion
+
+For LeRobot V30 datasets, convert them into the NPZ layout above before training:
+
+```bash
+cd /path/to/DeFi/Step3_DeFI
+
+python scripts/convert_lerobot_v30_to_defi_real_robot.py \
+  --input /path/to/lerobot_v30_dataset \
+  --output /path/to/defi_real_robot_dataset \
+  --frame_stride 1 \
+  --action_mode delta_pose_gripper \
+  --arm left \
+  --overwrite
+```
+
+Smoke-test conversion on a small subset:
+
+```bash
+python scripts/convert_lerobot_v30_to_defi_real_robot.py \
+  --input /path/to/lerobot_v30_dataset \
+  --output /path/to/defi_real_robot_smoke \
+  --max_episodes 2 \
+  --frame_stride 10 \
+  --action_mode delta_pose_gripper \
+  --arm left \
+  --overwrite
+```
+
+For Sparky cup datasets, prefer `--action_mode delta_pose_gripper`. It maps `observation.images.cam_left -> rgb_static`, `observation.images.cam_right -> rgb_gripper`, writes `robot_obs[0:7]` from the selected arm TCP pose, writes `robot_obs[14]` from `gripper_left`/`gripper_right`, and writes `rel_actions = [delta_xyz / max_pos, delta_euler_xyz / max_orn, gripper]`. The default normalization is `--max_pos 0.05` meters and `--max_orn 0.50` radians, matching the existing DeFi/RLBench relative-action convention.
+
+The legacy `--action_mode raw_slice` mode still exists for debugging, but it maps `action[:7] -> rel_actions`. For Sparky V30 data this is an absolute TCP pose, not a DeFi-compatible relative action, so do not use `raw_slice` for real-robot policy training.
+
+For joint-space LeRobot V30 datasets where `action` and `observation.state` are both 7D joint/gripper vectors, prefer `--action_mode joint_delta`. This writes `robot_obs[:7]` from the current state, pads the remaining DeFi proprio slots with zeros, maps the chosen video keys into `rgb_static` / `rgb_gripper`, and writes `rel_actions = clip((state[t+1] - state[t]) / max_joint_delta, -1, 1)` with the last dimension converted by `--gripper_mode`.
+
+Example for datasets with `observation.images.third_person` and `observation.images.wrist`:
+
+```bash
+python scripts/convert_lerobot_v30_to_defi_real_robot.py \
+  --input /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
+  --output /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups \
+  --static_video_key observation.images.third_person \
+  --gripper_video_key observation.images.wrist \
+  --action_mode joint_delta \
+  --overwrite
+```
+
+Full Sparky stack-cups conversion:
+
+```bash
+python scripts/convert_lerobot_v30_to_defi_real_robot.py \
+  --input /mnt/data/tacumi/lerobot_datasetV30_train_ready/sparky_ugripper/sparky_ugripper_stack_cups_v2gripper_R3_100_v30_tcp_train_ready \
+  --output /mnt/workspace/manipulation/datasets/defi_lerobot_stack_cups_delta \
+  --action_mode delta_pose_gripper \
+  --arm left \
+  --overwrite
+```
+
+Before real hardware rollout, verify the selected arm and gripper indices with `scripts/inspect_lerobot_action_semantics.py` and keep execution-side workspace/velocity limits enabled.
+
 Single-GPU example:
 
 ```bash

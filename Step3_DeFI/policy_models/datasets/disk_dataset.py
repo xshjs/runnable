@@ -174,7 +174,30 @@ class ExtendedDiskDataset(DiskDataset):
         self.random_frame_diff = False if img_gen_frame_diff > -1 else True  # False
         self.future_k_min = future_k_min
         self.future_k_max = future_k_max
-        
+        self._trim_episode_lookup_to_valid_starts()
+
+    def _trim_episode_lookup_to_valid_starts(self) -> None:
+        required_window = self.obs_seq_len + self.action_seq_len - 1
+        if required_window <= self.min_window_size:
+            return
+
+        valid_starts: list[int] = []
+        valid_lang_lookup: list[int] = []
+        lang_lookup = getattr(self, "lang_lookup", None)
+
+        for dataset_idx, start_idx in enumerate(self.episode_lookup.tolist()):
+            for ep_start, ep_end in self.ep_start_end_ids:
+                if ep_start <= start_idx <= ep_end:
+                    if start_idx + required_window - 1 <= ep_end:
+                        valid_starts.append(int(start_idx))
+                        if lang_lookup is not None:
+                            valid_lang_lookup.append(lang_lookup[dataset_idx])
+                    break
+
+        self.episode_lookup = np.asarray(valid_starts, dtype=np.int64)
+        if lang_lookup is not None:
+            self.lang_lookup = valid_lang_lookup
+
     # no use
     def find_sequence_boundaries(self, idx: int) -> Tuple[int, int]:
         for start_idx, end_idx in self.ep_start_end_ids:

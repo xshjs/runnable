@@ -34,7 +34,7 @@ class PositionalEncoding(nn.Module):
         self.pos_enc = pe
 
     def forward(self, x: Tensor) -> Tensor:
-        return x + self.pos_enc[:x.shape[2]].cuda()
+        return x + self.pos_enc[:x.shape[2]].to(device=x.device, dtype=x.dtype)
 
 
 class SelfAttention(nn.Module):

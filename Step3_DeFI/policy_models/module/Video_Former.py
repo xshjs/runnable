@@ -2,7 +2,11 @@
 
 import torch
 from einops import rearrange, repeat
-from einops_exts import rearrange_many
+try:
+    from einops_exts import rearrange_many
+except ModuleNotFoundError:
+    def rearrange_many(tensors, pattern, **kwargs):
+        return tuple(rearrange(tensor, pattern, **kwargs) for tensor in tensors)
 from torch import einsum, nn
 import torch.nn.functional as F
 

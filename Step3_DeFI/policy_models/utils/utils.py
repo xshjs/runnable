@@ -5,13 +5,15 @@ import time
 from typing import Dict, List, Union
 
 import cv2
-import git
 import hydra
 import numpy as np
-import pytorch_lightning
-from pytorch_lightning.utilities.cloud_io import load as pl_load
 import torch
 import tqdm
+
+try:
+    import git
+except ModuleNotFoundError:
+    git = None
 
 
 def timeit(method):
@@ -30,7 +32,7 @@ def timeit(method):
 
 
 def initialize_pretrained_weights(model, cfg):
-    pretrain_chk = pl_load(format_sftp_path(Path(cfg.pretrain_chk)), map_location=lambda storage, loc: storage)
+    pretrain_chk = torch.load(format_sftp_path(Path(cfg.pretrain_chk)), map_location="cpu")
     # batch_size = model.plan_recognition.position_embeddings.weight.shape[0]
     # weight = "plan_recognition.position_embeddings.weight"
     # pretrain_chk["state_dict"][weight] = pretrain_chk["state_dict"][weight][:batch_size]
@@ -42,6 +44,8 @@ def initialize_pretrained_weights(model, cfg):
 
 
 def get_git_commit_hash(repo_path: Path) -> str:
+    if git is None:
+        return "GitPython not installed"
     try:
         repo = git.Repo(search_parent_directories=True, path=repo_path.parent)
     except git.exc.InvalidGitRepositoryError:
@@ -98,11 +102,17 @@ def info_cuda() -> Dict[str, Union[str, List[str]]]:
 
 
 def info_packages() -> Dict[str, str]:
+    try:
+        import pytorch_lightning
+
+        pl_version = pytorch_lightning.__version__
+    except Exception:
+        pl_version = "unavailable"
     return {
         "numpy": np.__version__,
         "pyTorch_version": torch.__version__,
         "pyTorch_debug": str(torch.version.debug),
-        "pytorch-lightning": pytorch_lightning.__version__,
+        "pytorch-lightning": pl_version,
         "tqdm": tqdm.__version__,
     }
 

@@ -5,7 +5,10 @@ from scipy import integrate
 import torch
 from torch import nn
 import torchsde
-from torchdiffeq import odeint
+try:
+    from torchdiffeq import odeint
+except ModuleNotFoundError:
+    odeint = None
 from tqdm.auto import trange, tqdm
 from matplotlib import pyplot as plt
 import numpy as np
@@ -470,6 +473,8 @@ def log_likelihood(model, state, action, goal,  sigma_min, sigma_max, extra_args
     '''
     Computes the log-likelihood of actions 
     '''
+    if odeint is None:
+        raise ModuleNotFoundError("torchdiffeq is required for log_likelihood but is not installed")
     extra_args = {} if extra_args is None else extra_args
     s_in = action.new_ones([action.shape[0]])
     v = torch.randint_like(action, 2) * 2 - 1

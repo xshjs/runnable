@@ -1,3 +1,4 @@
+import torch
 from torch import nn
 from .utils import append_dims
 from policy_models.module.diffusion_decoder import DiffusionTransformer
@@ -21,8 +22,9 @@ class GCDenoiser(nn.Module):
         inner_model: The inner model used for denoising.
         sigma_data: The data sigma for scalings (default: 1.0).
     """
-    def __init__(self, action_dim, obs_dim, goal_dim, num_tokens, goal_window_size, obs_seq_len, act_seq_len, device, 
-                 use_original_diffusion_policy, sigma_data=1., proprio_dim=8):
+    def __init__(self, action_dim, obs_dim, goal_dim, num_tokens, goal_window_size, obs_seq_len, act_seq_len, device,
+                 use_original_diffusion_policy, sigma_data=1., proprio_dim=8,
+                 action_dim_weights=None, first_steps_weight=1.0, first_steps_count=0):
         super().__init__()
         self.inner_model = DiffusionTransformer(
             action_dim = action_dim,
@@ -48,6 +50,16 @@ class GCDenoiser(nn.Module):
             use_original_diffusion_policy = use_original_diffusion_policy,
         )
         self.sigma_data = sigma_data
+        if action_dim_weights is None:
+            action_dim_weights = [1.0] * action_dim
+        if len(action_dim_weights) != action_dim:
+            raise ValueError(f"expected {action_dim} action_dim_weights, got {len(action_dim_weights)}")
+        self.register_buffer(
+            "action_dim_weights",
+            torch.tensor(action_dim_weights, dtype=torch.float32),
+        )
+        self.first_steps_weight = float(first_steps_weight)
+        self.first_steps_count = int(first_steps_count)
 
     def get_scalings(self, sigma):
         """
@@ -85,7 +97,14 @@ class GCDenoiser(nn.Module):
                                         latent_motion_tokens_up,
                                         noised_input * c_in, goal, sigma, **kwargs)
         target = (action - c_skip * noised_input) / c_out
-        return (model_output - target).pow(2).flatten(1).mean(), model_output
+        sq_error = (model_output - target).pow(2)
+        dim_weights = self.action_dim_weights.view(1, 1, -1).to(device=sq_error.device, dtype=sq_error.dtype)
+        weighted_error = sq_error * dim_weights
+        if self.first_steps_count > 0 and self.first_steps_weight != 1.0:
+            step_weights = sq_error.new_ones((1, sq_error.shape[1], 1))
+            step_weights[:, : min(self.first_steps_count, sq_error.shape[1]), :] = self.first_steps_weight
+            weighted_error = weighted_error * step_weights
+        return weighted_error.mean(), model_output
 
     def forward(self, latent_motion_tokens_up,
                 state, action, goal, sigma, **kwargs):  # use for eval during train & rollout

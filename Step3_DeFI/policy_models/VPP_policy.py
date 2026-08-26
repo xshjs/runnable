@@ -228,6 +228,7 @@ class VPP_Policy(pl.LightningModule):
             n_rot_bins: int = 21,
             first_steps_weight: float = 1.0,
             first_steps_count: int = 0,
+            action_dim_weights: Optional[list[float]] = None,
             **unused_kwargs,
     ):
         super(VPP_Policy, self).__init__()
@@ -243,6 +244,7 @@ class VPP_Policy(pl.LightningModule):
         self.n_rot_bins = n_rot_bins
         self.first_steps_weight = first_steps_weight
         self.first_steps_count = first_steps_count
+        self.action_dim_weights = action_dim_weights or [1.0] * action_dim
         self.timestep = timestep  # 20, 正确的改去噪步骤输出视频从这里改
         self.extract_layer_idx = extract_layer_idx  # 1
         self.use_Former = use_Former  # '3d'
@@ -372,7 +374,10 @@ class VPP_Policy(pl.LightningModule):
                                     act_seq_len = action_seq_len,
                                     device=self.device,
                                     use_original_diffusion_policy=False,
-                                    sigma_data=0.5).to(self.device)
+                                    sigma_data=0.5,
+                                    action_dim_weights=self.action_dim_weights,
+                                    first_steps_weight=self.first_steps_weight,
+                                    first_steps_count=self.first_steps_count).to(self.device)
             self.lam = UncontrolledDINOLatentActionModel(t5_model_path=t5_model_path)
 
         self.optimizer_config = optimizer
@@ -824,9 +829,13 @@ class VPP_Policy(pl.LightningModule):
         """
         Method for doing inference with the model.
         """
+        lang_text = goal["lang_text"]
+        if isinstance(lang_text, tuple):
+            lang_text = list(lang_text)
+
         if 'lang_text' in goal:
             if self.use_text_not_embedding:  # true
-                latent_goal = self.language_goal(goal["lang_text"])  # torch.Size([28, 1, 512])
+                latent_goal = self.language_goal(lang_text)  # torch.Size([28, 1, 512])
                 latent_goal = latent_goal.to(torch.float32)
             else:
                 latent_goal = self.language_goal(goal["lang"]).unsqueeze(0).to(torch.float32).to(
@@ -837,7 +846,7 @@ class VPP_Policy(pl.LightningModule):
         rgb_static = obs["rgb_obs"]['rgb_static']  # torch.Size([28, 1, 3, 256, 256])
         rgb_gripper = obs["rgb_obs"]['rgb_gripper']  # torch.Size([28, 1, 3, 256, 256])
 
-        language = goal["lang_text"]
+        language = lang_text
 
         num_frames = self.Former_num_time_embeds  # Video lenth 16
         rgb_static = rgb_static.to(self.device)
@@ -847,7 +856,10 @@ class VPP_Policy(pl.LightningModule):
         # 1. Predictive Visual Representations Learning
         with torch.no_grad():
             input_rgb = torch.cat([rgb_static, rgb_gripper], dim=0)  # torch.Size([56, 1, 3, 256, 256])
-            language = [language] + [language]
+            if isinstance(language, list):
+                language = language + language
+            else:
+                language = [language, language]
             perceptual_features = self.TVP_encoder(input_rgb, language, self.timestep,  # torch.Size([56, 16, 2560, 16, 16])
                                                            self.extract_layer_idx, all_layer=self.use_all_layer,
                                                            step_time=1, max_length=self.max_length)
@@ -897,7 +909,7 @@ class VPP_Policy(pl.LightningModule):
         if self.use_univla:
             univla_out = self.lam(
                 perceptual_emb['state_images'],
-                goal["lang_text"],  # UniVLA stage 1 need to add, while stage 2 not need
+                lang_text,  # UniVLA stage 1 need to add, while stage 2 not need
             )
             latent_motion_tokens_up = univla_out['video_action_patches'].squeeze(1)
             perceptual_emb['state_images'] = perceptual_emb['state_images'].reshape(

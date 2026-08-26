@@ -13,19 +13,21 @@ seed: 242
 batch_size: 28
 max_epochs: 12
 log_every: 50
+save_every: 2000
 window_sampling_strategy: 'geometric'
 num_workers: 12
 img_gen_frame_diff: 3
+val_num_batches: 20
 
 
-act_seq_len: 10  # default 10, 这里改是在train的时候改action chunk
+act_seq_len: 50  # training action chunk
 obs_seq_len: 1
 
 model:
   _target_: policy_models.VPP_policy.VPP_Policy
   _recursive_: false
   latent_dim: 384
-  multistep: 10
+  multistep: 50
   sampler_type: 'ddim'
   num_sampling_steps: 10
   sigma_data: 0.5
@@ -34,10 +36,13 @@ model:
   noise_scheduler: 'exponential'
   sigma_sample_density_type: 'loglogistic'
   use_lr_scheduler: true
-  act_window_size: 10
+  act_window_size: 50
   obs_seq_len: ${obs_seq_len}
   action_dim: 7
   action_seq_len: ${act_seq_len}
+  first_steps_weight: 1.0
+  first_steps_count: 0
+  action_dim_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
   use_text_not_embedding: True
   seed: ${seed}
   Former_depth: 6
