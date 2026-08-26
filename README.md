@@ -5,6 +5,126 @@
 > [Wenyao Zhang*](https://zhangwenyao1.github.io/), [Bozhou Zhang*](https://zbozhou.github.io/), [Zekun Qi](https://qizekun.github.io/), [Wenjun Zeng](https://scholar.google.com/citations?user=_cUfvYQAAAAJ&hl=zh-CN), [Xin Jin](https://scholar.google.com/citations?user=byaSC-kAAAAJ&hl=zh-CN), [Li Zhang](https://lzrobots.github.io)  
 > **ICLR 2026**
 
+## X5 Real-Robot Runnable
+
+This repository now includes a runnable X5 real-robot path built around `Step3_DeFI`.
+
+If you only care about running the current X5 checkpoints on real data, start here instead of reading the full paper pipeline first.
+
+### Shared dataset folders
+
+- `pen`: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403`
+- `cups`: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133`
+
+### Recommended checkpoints
+
+- `pen` first-choice:
+  - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt`
+- `pen` second-choice:
+  - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt`
+- `cups` first-choice:
+  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
+- `cups` second-choice:
+  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt`
+
+As of August 26, 2026, the following export paths have already been verified to run successfully:
+
+- `pen` `epoch_002.pt`
+- `cups` `epoch_004.pt`
+
+### What the model outputs
+
+The Step3 DeFi action head predicts normalized 7D relative actions:
+
+- dim `0:3`: normalized EE `delta_xyz`
+- dim `3:6`: normalized EE `delta_euler_xyz`
+- dim `6`: gripper signal
+
+This is not a raw X5 command. For real-robot rollout, export it into:
+
+- `ee.npy` if the execution side consumes end-effector delta pose
+- `joint.npy` if the execution side consumes joint deltas
+
+For current X5 integration, prefer `ee.npy` first.
+
+### Real-robot export commands
+
+`pen` first-choice, export `raw + ee + joint`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+`cups` first-choice, export `raw + ee + joint`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+Generated files are written under each shared folder:
+
+- `x5_exports/validation_sample_00000_raw.npy`
+- `x5_exports/validation_sample_00000_ee.npy`
+- `x5_exports/validation_sample_00000_joint.npy`
+- `x5_exports/validation_sample_00000_summary.json`
+
+### Training on X5 datasets
+
+The current X5 real-robot training entrypoint is:
+
+- `Step3_DeFI/scripts/train_calvin_real_robot.sh`
+
+The converted DeFi-format datasets currently used are:
+
+- `pen`: `/mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5`
+- `cups`: `/mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5`
+
+Current training setup used for the recommended checkpoints:
+
+- action chunk: `50`
+- action definition: future state offset `5`
+- checkpoint saving:
+  - every epoch
+  - every `2000` steps
+  - best validation checkpoint as `best_val.pt`
+
+For detailed Step3 runnable notes, see:
+
+- `Step3_DeFI/README_BASELINE_RUNNABLE.md`
+- `Step3_DeFI/RUNNABLE_UPLOAD_MANIFEST.md`
+
 ## Abstract
 Vision-language-action (VLA) models have shown great potential in building generalist robots, but still face a dilemma–misalignment of 2D image forecasting and 3D action prediction. Besides, such a vision-action entangled training manner limits model learning from large-scale, action-free web video data. To address these issues, we propose DeFI, a novel framework that Decouples visual Forward and Inverse dynamics pretraining to exploit respective data sources, wherein video generation and action prediction are disentangled. We introduce the General Forward Dynamics Model (GFDM), pretrained on diverse human and robot videos for future prediction, and the General Inverse Dynamics Model (GIDM), trained via self-supervised learning to infer latent actions from unlabeled video transitions. These models are then integrated into a unified architecture for end-to-end fine-tuning on downstream tasks. In this manner, GFDM and GIDM first shine separately and then cooperate for mutual benefit. Extensive experiments on CALVIN ABC-D and SimplerEnv demonstrate state-of-the-art performance, with DeFI achieving an average task length of 4.51 for CALVIN, 51.2% success rate on SimplerEnvFractal benchmark and 81.3% success rate in real-world deployment, significantly outperforming prior methods.
 
