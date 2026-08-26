@@ -7,9 +7,9 @@
 
 ## X5 Real-Robot Runnable
 
-This repository now includes a runnable X5 real-robot path built around `Step3_DeFI`.
+This repository now also includes a runnable X5 real-robot path built around `Step3_DeFI`.
 
-If you only care about running the current X5 checkpoints on real data, start here instead of reading the full paper pipeline first.
+The original environment, checkpoint, and Stage 1/2/3 sections below remain the primary paper-oriented documentation. This section is only an additional shortcut for the current X5 `pen` / `cups` workflow.
 
 ### Shared dataset folders
 
@@ -170,6 +170,13 @@ pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https
 
 Download these weights and place them in the "ckpts" folder.
 
+For the current X5 real-robot runnable path, the same base checkpoints are used together with the following recommended Step3 task checkpoints:
+
+- `pen`: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt`
+- `pen` alternative: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt`
+- `cups`: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
+- `cups` alternative: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt`
+
 </details>
 
 <details>
@@ -223,6 +230,11 @@ data/oxe/
 ### Stage 3
 Download the Calvin ABC-D dataset from follow [Calvin](https://github.com/mees/calvin?tab=readme-ov-file#computer--quick-start).
 
+For the current X5 real-robot runnable path, the converted DeFi-format datasets are:
+
+- `pen`: `/mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5`
+- `cups`: `/mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5`
+
 </details>
 
 ## Train and eval
@@ -258,6 +270,98 @@ scripts/train_calvin.sh
 scripts/rollout_calvin.sh
 
 ```
+
+## X5 Pen/Cups commands
+
+The following commands are additive examples for the current X5 real-robot setup. They do not replace the original Stage 1/2/3 pipeline above.
+
+### Step 3 training
+
+Train `pen`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+ROOT_DATA_DIR=/mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
+VIDEO_MODEL_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+TEXT_ENCODER_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+T5_MODEL_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+LANGUAGE_GOAL_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+NUM_GPUS=1 \
+BATCH_SIZE=14 \
+MAX_EPOCHS=12 \
+NUM_WORKERS=12 \
+SAVE_EVERY=2000 \
+PYTHON_BIN=/mnt/data/xiyin/manipulation/DeFi/.venv/bin/python \
+bash scripts/train_calvin_real_robot.sh
+```
+
+Train `cups`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+ROOT_DATA_DIR=/mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+VIDEO_MODEL_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+TEXT_ENCODER_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+T5_MODEL_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+LANGUAGE_GOAL_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+NUM_GPUS=1 \
+BATCH_SIZE=14 \
+MAX_EPOCHS=12 \
+NUM_WORKERS=12 \
+SAVE_EVERY=2000 \
+PYTHON_BIN=/mnt/data/xiyin/manipulation/DeFi/.venv/bin/python \
+bash scripts/train_calvin_real_robot.sh
+```
+
+### Step 3 export for real hardware
+
+Export `pen` first-choice checkpoint to `raw + ee + joint`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+Export `cups` first-choice checkpoint to `raw + ee + joint`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+For real-hardware rollout, use the generated `ee.npy` first unless the execution side explicitly requires joint deltas.
 
 ## BibTeX
 ```bibtex
