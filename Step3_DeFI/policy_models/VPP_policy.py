@@ -16,11 +16,17 @@ except Exception:
 
 try:
     import transformers.utils as _tf_utils
+    import transformers.utils.import_utils as _tf_import_utils
+    import transformers.modeling_utils as _tf_modeling_utils
 
     if not hasattr(_tf_utils, "FLAX_WEIGHTS_NAME"):
         _tf_utils.FLAX_WEIGHTS_NAME = "flax_model.msgpack"
     if hasattr(_tf_utils, "check_torch_load_is_safe"):
         _tf_utils.check_torch_load_is_safe = lambda: None
+    if hasattr(_tf_import_utils, "check_torch_load_is_safe"):
+        _tf_import_utils.check_torch_load_is_safe = lambda: None
+    if hasattr(_tf_modeling_utils, "check_torch_load_is_safe"):
+        _tf_modeling_utils.check_torch_load_is_safe = lambda: None
 except Exception:
     pass
 
@@ -232,6 +238,7 @@ class VPP_Policy(pl.LightningModule):
             **unused_kwargs,
     ):
         super(VPP_Policy, self).__init__()
+        init_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.latent_dim = latent_dim
         self.use_all_layer = use_all_layer
         self.use_position_encoding = use_position_encoding
@@ -312,10 +319,10 @@ class VPP_Policy(pl.LightningModule):
         # self.language_goal = LangClip(model_name='ViT-B/32').to(self.device)
         self.language_goal = LangClip(
             model_name=self.language_goal_path).to(
-                self.device)
+                init_device)
 
         pipeline, tokenizer, feature_extractor, train_scheduler, vae_processor, text_encoder, vae, unet = load_primary_models(
-            pretrained_model_path , eval = True, device=self.device)
+            pretrained_model_path , eval = True, device=init_device)
 
         from transformers import AutoTokenizer, CLIPTextModelWithProjection
 
@@ -329,7 +336,7 @@ class VPP_Policy(pl.LightningModule):
             local_files_only=True,
         )
 
-        text_encoder = text_encoder.to(self.device).eval()
+        text_encoder = text_encoder.to(init_device).eval()
 
         for param in pipeline.image_encoder.parameters():
             param.requires_grad = False
@@ -341,7 +348,7 @@ class VPP_Policy(pl.LightningModule):
         for param in pipeline.unet.parameters():
             param.requires_grad = False
 
-        pipeline = pipeline.to(self.device)
+        pipeline = pipeline.to(init_device)
         pipeline.unet.eval()
 
         from policy_models.module.diffusion_extract import Diffusion_feature_extractor
@@ -350,7 +357,7 @@ class VPP_Policy(pl.LightningModule):
                                                         tokenizer=tokenizer,
                                                         text_encoder=text_encoder,
                                                         position_encoding = self.use_position_encoding)
-        self.TVP_encoder = self.TVP_encoder.to(self.device)
+        self.TVP_encoder = self.TVP_encoder.to(init_device)
 
         if not self.use_original_diffusion_policy and self.use_univla:
             self.goal_emb = nn.Sequential(
@@ -358,7 +365,7 @@ class VPP_Policy(pl.LightningModule):
                 nn.GELU(),
                 nn.Linear(768, 768)
             )
-            self.goal_emb = self.goal_emb.to(self.device)
+            self.goal_emb = self.goal_emb.to(init_device)
             self.time_pos_emb = nn.Parameter(torch.randn(2, 1, 768))
 
         # policy network
@@ -372,12 +379,12 @@ class VPP_Policy(pl.LightningModule):
                                     goal_window_size = 1,
                                     obs_seq_len = obs_seq_len,
                                     act_seq_len = action_seq_len,
-                                    device=self.device,
+                                    device=init_device,
                                     use_original_diffusion_policy=False,
                                     sigma_data=0.5,
                                     action_dim_weights=self.action_dim_weights,
                                     first_steps_weight=self.first_steps_weight,
-                                    first_steps_count=self.first_steps_count).to(self.device)
+                                    first_steps_count=self.first_steps_count).to(init_device)
             self.lam = UncontrolledDINOLatentActionModel(t5_model_path=t5_model_path)
 
         self.optimizer_config = optimizer
@@ -405,7 +412,7 @@ class VPP_Policy(pl.LightningModule):
             nn.Linear(self.action_intent_dim, 512),
             nn.GELU(),
             nn.Linear(512, 512),
-        ).to(self.device)
+        ).to(init_device)
         self.override_action_intent = None
 
         # for clip loss ground truth plot

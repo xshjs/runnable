@@ -47,7 +47,8 @@ class UncontrolledDINOLatentActionModel(nn.Module):
         else:
             REPO_ROOT = Path(__file__).resolve().parents[3]
         CKPT_DIR = REPO_ROOT / "ckpts"
-        T5_BASE_DIR = CKPT_DIR / "t5_base"
+        # Allow the runnable branch to override the shared T5 location without editing source again.
+        T5_BASE_DIR = Path(os.environ.get("DEFI_T5_MODEL_PATH", str(CKPT_DIR / "t5_base")))
 
         self.dino_transform = transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD)
 

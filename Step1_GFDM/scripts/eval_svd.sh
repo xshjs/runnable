@@ -3,10 +3,10 @@
 <<COMMENT
 Command:
 sh scripts/eval_svd.sh \
-    /DeFI/ckpts/svd/checkpoint-100000 \
-    /DeFI/ckpts/openai_clip_vit_base_patch32 \
-    /DeFI/ckpts/opensource_robotdata/bridge \
-    2+10+8+14 \
+    /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+    /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+    /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5/validation \
+    0 \
     30 \
     2>&1 | tee eval_svd.log
 COMMENT

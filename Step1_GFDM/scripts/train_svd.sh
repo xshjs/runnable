@@ -3,9 +3,9 @@
 <<COMMENT
 Command:
 sh scripts/train_svd.sh \
-    /DeFI/ckpts/stabilityai_stable_video_diffusion_img2vid \
-    /DeFI/ckpts/openai_clip_vit_base_patch32 \
-    /DeFI/ckpts/opensource_robotdata \
+    /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+    /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+    /mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
     29506 \
     8 \
     2>&1 | tee train_svd.log

@@ -176,6 +176,43 @@ python scripts/convert_lerobot_v30_to_defi_real_robot.py \
 
 Before real hardware rollout, verify the selected arm and gripper indices with `scripts/inspect_lerobot_action_semantics.py` and keep execution-side workspace/velocity limits enabled.
 
+For X5 real-robot deployment, note that the DeFi action head predicts normalized relative actions, not raw robot commands. For the current X5 real-robot conversion path this means:
+
+- model output dim 0:3 -> normalized EE `delta_xyz`
+- model output dim 3:6 -> normalized EE `delta_euler_xyz`
+- model output dim 6 -> gripper open/close signal
+
+To convert a saved prediction array into metric EE deltas for an execution side that expects EE increments, use:
+
+```bash
+python scripts/convert_defi_rel_action_to_x5_ee.py \
+  --input /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/x5_exports/validation_sample_00000_raw.npy \
+  --output /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/x5_exports/validation_sample_00000_ee.npy \
+  --max_pos 0.05 \
+  --max_orn 0.50 \
+  --binary_gripper
+```
+
+This produces `dx, dy, dz` in meters and `droll, dpitch, dyaw` in radians. If the execution side expects joint deltas instead, an additional IK/controller layer is still required.
+
+For an execution side that expects X5 joint deltas instead of EE deltas, use:
+
+```bash
+python scripts/convert_defi_rel_action_to_x5_joint.py \
+  --action_input /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/x5_exports/validation_sample_00000_raw.npy \
+  --dataset_root /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --output /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/x5_exports/validation_sample_00000_joint.npy \
+  --max_pos 0.05 \
+  --max_orn 0.50 \
+  --max_joint_delta 0.05 \
+  --binary_gripper
+```
+
+This uses a numerical Jacobian plus damped least squares, so it is suitable as a rollout adapter or offline conversion baseline. For final online deployment, still keep robot-side joint, workspace, and velocity limits enabled.
+
 Single-GPU example:
 
 ```bash
@@ -223,6 +260,230 @@ MAX_EPOCHS=12 \
 PYTHON_BIN=/path/to/venv/bin/python \
 bash Step3_DeFI/scripts/train_calvin_real_robot.sh
 ```
+
+## 4.1 X5 real-robot ckpts and export commands
+
+Current shared dataset folders:
+
+- `pen`:
+  - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403`
+- `cups`:
+  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133`
+
+Current recommended checkpoints for real-hardware bring-up:
+
+- `pen` primary:
+  - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt`
+- `pen` secondary:
+  - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt`
+- `cups` primary:
+  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
+- `cups` secondary:
+  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt`
+
+Current recommendation for first real-hardware rollout:
+
+- `pen`: start from `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt`
+- `cups`: start from `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
+
+Export `pen` primary ckpt to `raw + ee + joint`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+Export `pen` secondary ckpt:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+Export `cups` primary ckpt:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+Export `cups` secondary ckpt:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+The generated outputs are written under each shared dataset folder:
+
+- `x5_exports/validation_sample_00000_raw.npy`
+- `x5_exports/validation_sample_00000_ee.npy`
+- `x5_exports/validation_sample_00000_joint.npy`
+- `x5_exports/validation_sample_00000_summary.json`
+
+For real-hardware rollout, prefer `ee.npy` first. Use `joint.npy` as a compatibility or comparison path if the execution side requires joint deltas.
+
+## 4.2 X5 real-hardware test commands
+
+The export script is the intended bridge from a Step3 DeFi checkpoint to X5-consumable rollout files.
+
+If the execution side consumes EE delta pose, run one of the commands below and use the generated `ee.npy`.
+
+`pen` primary, EE-only export:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode ee \
+  --binary_gripper
+```
+
+`cups` primary, EE-only export:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode ee \
+  --binary_gripper
+```
+
+If the execution side consumes joint deltas, run the `all` export and use the generated `joint.npy`.
+
+`pen` primary, export `raw + ee + joint`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+`cups` primary, export `raw + ee + joint`:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+Expected rollout files:
+
+- `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/x5_exports/validation_sample_00000_ee.npy`
+- `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/x5_exports/validation_sample_00000_joint.npy`
+- `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/x5_exports/validation_sample_00000_ee.npy`
+- `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/x5_exports/validation_sample_00000_joint.npy`
+
+Known-good status as of August 26, 2026:
+
+- `pen` `epoch_002.pt` has already been verified to export successfully
+- `cups` `epoch_004.pt` has already been verified to export successfully
+- older checkpoints may print `missing_keys: ["model.action_dim_weights"]`
+- that missing-key message is expected for inference and does not block export
 
 If your team uses a different training launcher, keep the same contract:
 

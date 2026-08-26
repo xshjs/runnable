@@ -1,17 +1,40 @@
 # Runnable Upload Manifest
 
-This file lists the minimal code and checkpoint recommendations for the real-robot DeFi runnable upload.
+This file lists the minimal code and checkpoint recommendations for the X5 real-robot runnable upload.
+
+## Shared dataset folders
+
+- `pen`: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403`
+- `cups`: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133`
 
 ## Recommended ckpts
 
 - `pen_tape_cutter_tray` primary:
-  - `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-24_20-08-09/saved_models/epoch_002.pt`
+  - shared path: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt`
+  - source path: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-24_20-08-09/saved_models/epoch_002.pt`
 - `pen_tape_cutter_tray` secondary:
-  - `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_19-44-39/saved_models/best_val.pt`
+  - shared path: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt`
+  - source path: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_19-44-39/saved_models/best_val.pt`
 - `stack_cups` primary:
-  - `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_09-47-55/saved_models/epoch_004.pt`
+  - shared path: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
+  - source path: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_09-47-55/saved_models/epoch_004.pt`
 - `stack_cups` secondary:
-  - `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_09-47-55/saved_models/epoch_007.pt`
+  - shared path: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt`
+  - source path: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_09-47-55/saved_models/epoch_007.pt`
+
+## Shared ckpt placement
+
+For collaborator handoff, place the four selected checkpoints into the original shared dataset folders:
+
+- `pen` checkpoints under `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403`
+- `cups` checkpoints under `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133`
+
+The X5 export script writes rollout-ready files under each shared folder:
+
+- `x5_exports/validation_sample_00000_raw.npy`
+- `x5_exports/validation_sample_00000_ee.npy`
+- `x5_exports/validation_sample_00000_joint.npy`
+- `x5_exports/validation_sample_00000_summary.json`
 
 ## Upload this code set
 
@@ -19,6 +42,9 @@ These files are the core changes for real-robot dataset conversion, training, va
 
 - `Step3_DeFI/scripts/convert_lerobot_v30_to_defi_real_robot.py`
 - `Step3_DeFI/scripts/compute_x5_ee_from_lerobot.py`
+- `Step3_DeFI/scripts/convert_defi_rel_action_to_x5_ee.py`
+- `Step3_DeFI/scripts/convert_defi_rel_action_to_x5_joint.py`
+- `Step3_DeFI/scripts/export_x5_action_from_ckpt.py`
 - `Step3_DeFI/scripts/train_calvin.py`
 - `Step3_DeFI/scripts/train_calvin_real_robot.sh`
 - `Step3_DeFI/policy_conf/VPP_Calvinabc_train.yaml`
@@ -28,6 +54,7 @@ These files are the core changes for real-robot dataset conversion, training, va
 - `Step3_DeFI/policy_models/edm_diffusion/score_wrappers.py`
 - `Step3_DeFI/policy_models/m_former_univla/blocks.py`
 - `Step3_DeFI/policy_models/module/Video_Former.py`
+- `Step3_DeFI/policy_models/utils/x5_action_conversion.py`
 - `Step3_DeFI/policy_models/utils/utils.py`
 - `Step3_DeFI/README_BASELINE_RUNNABLE.md`
 
@@ -47,6 +74,10 @@ These files are the core changes for real-robot dataset conversion, training, va
   - every epoch as `epoch_xxx.pt`
   - best validation checkpoint as `best_val.pt`
 - Compatibility fixes for missing optional deps and CPU/CUDA hardcoding issues.
+- Checkpoint export path from normalized DeFi output to:
+  - raw normalized chunk
+  - EE delta chunk
+  - joint delta chunk
 
 ## Current training config behavior
 
@@ -54,6 +85,54 @@ These files are the core changes for real-robot dataset conversion, training, va
 - `val_num_batches: 20`
 - `act_seq_len: 50`
 - `multistep: 50`
+
+## Recommended X5 export commands
+
+Use the shared checkpoints directly from the two shared dataset folders.
+
+`pen` primary:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
+
+`cups` primary:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/export_x5_action_from_ckpt.py \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
+  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
+  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
+  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
+  --split validation \
+  --sample_index 0 \
+  --export_mode all \
+  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
+  --episode_index 0 \
+  --frame_index 0 \
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
+  --binary_gripper
+```
 
 ## Note on `action_dim_weights`
 
