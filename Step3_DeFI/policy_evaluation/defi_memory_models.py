@@ -48,7 +48,10 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def load_rollout_rows(path: Path) -> Dict[int, Dict[str, Any]]:
-    return {int(row["row_id"]): row for row in iter_jsonl(path)}
+    rows = list(iter_jsonl(path))
+    if rows and "row_id" not in rows[0]:
+        return {idx: dict(row, row_id=idx) for idx, row in enumerate(rows)}
+    return {int(row["row_id"]): row for row in rows}
 
 
 def load_labeled_rows(path: Path) -> List[Dict[str, Any]]:
@@ -58,6 +61,47 @@ def load_labeled_rows(path: Path) -> List[Dict[str, Any]]:
 def load_memory_arrays(path: Path) -> Dict[str, np.ndarray]:
     with np.load(path, allow_pickle=True) as data:
         return {key: data[key] for key in data.files}
+
+
+def summarize_feature(arr: np.ndarray) -> np.ndarray:
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros((1,), dtype=np.float32)
+    if arr.ndim <= 1:
+        return arr.reshape(-1).astype(np.float32)
+    return arr.reshape(-1, arr.shape[-1]).mean(axis=0).astype(np.float32)
+
+
+def sketch_vector(vec: np.ndarray, dim: int = 768) -> np.ndarray:
+    flat = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if dim <= 0:
+        return flat.astype(np.float32)
+    if flat.size == 0:
+        return np.zeros((dim,), dtype=np.float32)
+    if flat.size == dim:
+        out = flat.astype(np.float32)
+    else:
+        out = np.zeros((dim,), dtype=np.float32)
+        for idx, value in enumerate(flat):
+            out[idx % dim] += float(value)
+    norm = float(np.linalg.norm(out))
+    if norm > 1e-12:
+        out = out / norm
+    return out.astype(np.float32)
+
+
+def feature_signature(x: np.ndarray, dim: int = 768) -> np.ndarray:
+    arr = np.asarray(x, dtype=np.float32)
+    if arr.size == 0:
+        return np.zeros((dim,), dtype=np.float32)
+    if arr.ndim > 1:
+        try:
+            arr = arr.reshape(-1, arr.shape[-1]).mean(axis=0)
+        except Exception:
+            arr = arr.reshape(-1)
+    else:
+        arr = arr.reshape(-1)
+    return sketch_vector(arr, dim=dim)
 
 
 def encode_texts_t5(
@@ -146,19 +190,33 @@ def retrieve_memory_topk(
     if candidate_idx.size == 0:
         candidate_idx = np.nonzero(row_ids != int(exclude_row_id) if exclude_row_id is not None else np.ones_like(row_ids, dtype=bool))[0]
     if candidate_idx.size == 0:
-        dim = future_bank.shape[1]
+        dim = 768
         return (
             np.zeros((dim,), dtype=np.float32),
             np.zeros((dim,), dtype=np.float32),
             np.asarray([], dtype=np.int64),
             np.asarray([], dtype=np.float32),
         )
-    scores = np.asarray([cosine(future_feature, future_bank[idx]) for idx in candidate_idx], dtype=np.float32)
+
+    query_signature = feature_signature(future_feature, dim=768)
+    bank_signatures = np.stack(
+        [feature_signature(future_bank[idx], dim=query_signature.size) for idx in candidate_idx],
+        axis=0,
+    ).astype(np.float32)
+    scores = np.asarray([cosine(query_signature, bank_signatures[idx]) for idx in range(bank_signatures.shape[0])], dtype=np.float32)
     order = np.argsort(-scores)[: max(1, topk)]
     chosen = candidate_idx[order]
+    selected_futures = np.stack(
+        [feature_signature(future_bank[idx], dim=query_signature.size) for idx in chosen],
+        axis=0,
+    ).astype(np.float32)
+    selected_deltas = np.stack(
+        [feature_signature(delta_bank[idx], dim=query_signature.size) for idx in chosen],
+        axis=0,
+    ).astype(np.float32)
     return (
-        future_bank[chosen].mean(axis=0).astype(np.float32),
-        delta_bank[chosen].mean(axis=0).astype(np.float32),
+        selected_futures.mean(axis=0).astype(np.float32),
+        selected_deltas.mean(axis=0).astype(np.float32),
         row_ids[chosen].astype(np.int64),
         scores[order].astype(np.float32),
     )

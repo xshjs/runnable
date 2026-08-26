@@ -1,4 +1,3 @@
-from matplotlib.pyplot import cla
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -877,4 +876,3 @@ class MeanPooling(nn.Module):
 
     def forward(self, x):
         return x.mean(dim=1).view(-1, self.token_dim)
-

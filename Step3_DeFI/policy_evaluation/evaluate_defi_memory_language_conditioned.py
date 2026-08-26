@@ -25,6 +25,7 @@ from policy_evaluation.calvin_evaluate import evaluate_sequence as calvin_evalua
 from policy_evaluation.calvin_evaluate import evaluate_policy as calvin_evaluate_policy
 from policy_evaluation.calvin_evaluate import rollout as calvin_baseline_rollout
 from policy_evaluation.defi_memory_models import load_memory_arrays
+from policy_evaluation.defi_memory_models import feature_signature
 from policy_evaluation.memory_state_guided_adapter import MemoryStateGuidedAdapter
 from policy_evaluation.memory_weight_calibrator import MemoryWeightCalibrator, pad_weight_inputs
 
@@ -205,6 +206,96 @@ def cosine_np(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(lhs, rhs) / denom)
 
 
+def recoverability_to_score(recoverability: str) -> float:
+    label = str(recoverability).strip().lower()
+    if "repair" in label:
+        return 0.85
+    if "uncertain" in label:
+        return 0.45
+    if "not" in label or "none" in label:
+        return 0.1
+    return 0.35
+
+
+def counterfactual_residual_gate(
+    decision: Any,
+    base_future: np.ndarray,
+    proposal_future: np.ndarray,
+    memory_sims: np.ndarray,
+    memory_ids: Sequence[str],
+) -> Tuple[float, Dict[str, float]]:
+    base_np = np.asarray(base_future, dtype=np.float32).reshape(-1)
+    proposal_np = np.asarray(proposal_future, dtype=np.float32).reshape(-1)
+    if base_np.size == 0 or proposal_np.size == 0:
+        return 0.0, {
+            "trust_score": float(getattr(decision, "trust_score", 0.5)),
+            "recoverability_score": recoverability_to_score(getattr(decision, "recoverability", "uncertain")),
+            "memory_support": 0.0,
+            "alignment": 0.0,
+            "gate": 0.0,
+        }
+    trust_score = float(np.clip(getattr(decision, "trust_score", 0.5), 0.0, 1.0))
+    recoverability_score = float(recoverability_to_score(getattr(decision, "recoverability", "uncertain")))
+    sim_arr = np.asarray(memory_sims, dtype=np.float32).reshape(-1)
+    valid_len = min(len(memory_ids), int(sim_arr.shape[0])) if memory_ids else int(sim_arr.shape[0])
+    memory_support = float(np.clip(np.mean(np.clip(sim_arr[:valid_len], 0.0, 1.0)), 0.0, 1.0)) if valid_len > 0 else 0.0
+    alignment = float(np.clip((cosine_np(base_np, proposal_np) + 1.0) / 2.0, 0.0, 1.0))
+    mismatch = str(getattr(decision, "mismatch_type", "uncertain")).strip().lower()
+    if mismatch == "none":
+        mismatch_bonus = 0.0
+    elif "hallucin" in mismatch or "contact" in mismatch or "overestimated" in mismatch:
+        mismatch_bonus = 0.35
+    elif "slow_success" in mismatch:
+        mismatch_bonus = 0.12
+    else:
+        mismatch_bonus = 0.2
+
+    gate = (
+        0.02
+        + 0.08 * trust_score
+        + 0.10 * recoverability_score
+        + 0.10 * memory_support
+        + 0.06 * alignment
+        + 0.05 * mismatch_bonus
+    )
+    gate *= float(np.clip((alignment - 0.18) / 0.55, 0.0, 1.0))
+    if mismatch == "none":
+        gate = min(gate, 0.06)
+    elif "slow_success" in mismatch:
+        gate = min(gate, 0.10)
+    gate = float(np.clip(gate, 0.0, 0.30))
+    if memory_support < 0.15 and trust_score < 0.4:
+        gate *= 0.5
+    trace = {
+        "trust_score": trust_score,
+        "recoverability_score": recoverability_score,
+        "memory_support": memory_support,
+        "alignment": alignment,
+        "gate": gate,
+    }
+    return gate, trace
+
+
+def blend_counterfactual_future(
+    base_future: torch.Tensor,
+    proposal_future: torch.Tensor,
+    decision: Any,
+    memory_sims: np.ndarray,
+    memory_ids: Sequence[str],
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    gate, trace = counterfactual_residual_gate(
+        decision,
+        base_future.detach().cpu().numpy(),
+        proposal_future.detach().cpu().numpy(),
+        memory_sims,
+        memory_ids,
+    )
+    corrected = base_future + gate * (proposal_future - base_future)
+    trace["residual_norm"] = float(torch.norm((proposal_future - base_future).reshape(-1), p=2).item())
+    trace["corrected_shift_norm"] = float(torch.norm((corrected - base_future).reshape(-1), p=2).item())
+    return corrected, trace
+
+
 def retrieve_adapter_memory_topk(
     task: str,
     future_feature: np.ndarray,
@@ -379,6 +470,37 @@ def build_postexec_reflection_prompt(
     )
 
 
+def build_counterfactual_reflection_prompt(
+    task: str,
+    next_task: Optional[str],
+    base_text: str,
+    recent_summary: str,
+    key_summary: str,
+    important_summary: str,
+    rule_text: str,
+) -> str:
+    next_text = next_task or "none"
+    return (
+        "You are doing a pre-execution counterfactual audit.\n"
+        "No real failure has happened yet. Imagine the most likely failure if this future were executed as-is, "
+        "then describe the counterfactual future that should replace it.\n"
+        "Return one compact JSON object only with keys: "
+        '{"trust": "high|medium|low", "mismatch_type": string, "hypothetical_failure": string, '
+        '"counterfactual_future": string, "correction_direction": string, "failure_factor": string, '
+        '"intervention": string, "recoverability": string, "explanation": string}.\n'
+        "failure_factor must be one of: contact, object_displacement, object_identity, "
+        "drawer_slider_progress, goal_completion, none.\n"
+        "Use short phrases.\n"
+        f"task: {task}\n"
+        f"next_task: {next_text}\n"
+        f"base_instruction: {base_text}\n"
+        f"recent_memory: {recent_summary}\n"
+        f"key_memory: {key_summary}\n"
+        f"important_events: {important_summary}\n"
+        f"repair_rule: {rule_text}\n"
+    )
+
+
 def build_augmented_instruction(base_text: str, prev_row: Dict[str, Any], important_summary: str) -> str:
     short_fix = str(prev_row.get('correction_direction', 'stabilize contact')).replace(" ", "_")[:24]
     short_mismatch = str(prev_row.get('mismatch_type', 'unknown')).replace(" ", "_")[:24]
@@ -392,6 +514,27 @@ def build_augmented_instruction(base_text: str, prev_row: Dict[str, Any], import
         f"fix={short_fix}; "
         f"events={short_events}."
     )
+
+
+def build_counterfactual_instruction(base_text: str, prev_row: Dict[str, Any], important_summary: str) -> str:
+    del important_summary
+    short_failure = str(prev_row.get("hypothetical_failure", "possible drift")).replace(" ", "_")[:18]
+    short_cf = str(prev_row.get("counterfactual_future", "preserve_progress")).replace(" ", "_")[:18]
+    short_fix = str(prev_row.get("correction_direction", "stabilize_contact")).replace(" ", "_")[:18]
+    short_mismatch = str(prev_row.get("mismatch_type", "unknown")).replace(" ", "_")[:18]
+    short_trust = str(prev_row.get("trust", trust_score_to_label(float(prev_row.get("trust_score", 0.5))))).replace(" ", "_")[:6]
+    prompt = (
+        f"{base_text}. "
+        f"cf={short_cf}; "
+        f"fail={short_failure}; "
+        f"fix={short_fix}; "
+        f"m={short_mismatch}; "
+        f"t={short_trust}"
+    )
+    # Keep the future prompt short enough for the text encoder context window.
+    if len(prompt) > 180:
+        prompt = f"{base_text}. cf={short_cf}; fix={short_fix}"
+    return prompt[:180]
 
 
 def make_reflection_row(
@@ -425,6 +568,8 @@ def make_reflection_row(
         "trust": trust_score_to_label(float(decision.trust_score)),
         "mismatch_type": mismatch_type if mismatch_type != "none" else decision.mismatch_type,
         "correction_direction": decision.correction_direction,
+        "hypothetical_failure": getattr(decision, "hypothetical_failure", ""),
+        "counterfactual_future": getattr(decision, "counterfactual_future", ""),
         "reflection_text": decision.raw_text,
         "lang_text": lang_text,
         "rule_text": rule_text,

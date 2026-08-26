@@ -254,6 +254,10 @@ class MemoryReflectionDecision:
     recoverability: str
     explanation: str
     raw_text: str
+    hypothetical_failure: str = ""
+    counterfactual_future: str = ""
+    failure_factor: str = ""
+    intervention: str = ""
 
 
 def trust_label_to_score(value: Any) -> float:
@@ -1683,6 +1687,10 @@ def parse_memory_reflection_output(raw_text: str) -> MemoryReflectionDecision:
         recoverability=str(payload.get("recoverability", "uncertain"))[:64],
         explanation=str(payload.get("explanation", "uncertain"))[:512],
         raw_text=clean[:1000],
+        hypothetical_failure=str(payload.get("hypothetical_failure", payload.get("failure_hypothesis", "")))[:256],
+        counterfactual_future=str(payload.get("counterfactual_future", payload.get("counterfactual_future_text", "")))[:256],
+        failure_factor=str(payload.get("failure_factor", ""))[:128],
+        intervention=str(payload.get("intervention", ""))[:256],
     )
 
 
@@ -1701,6 +1709,8 @@ def template_postexec_reflection_decision(
             recoverability="not_repairable",
             explanation=f"{task} succeeded cleanly; keep the future consistent with achieved progress.",
             raw_text='{"trust_score":0.85,"mismatch_type":"none","correction_direction":"preserve progress","recoverability":"not_repairable","explanation":"success"}',
+            hypothetical_failure="none",
+            counterfactual_future="preserve progress",
         )
     if mismatch_type == "drawer_progress_hallucinated":
         return MemoryReflectionDecision(
@@ -1710,6 +1720,8 @@ def template_postexec_reflection_decision(
             recoverability="repairable",
             explanation="The imagined future advanced drawer state too early; require verified drawer motion first.",
             raw_text='{"trust_score":0.25,"mismatch_type":"drawer_progress_hallucinated","correction_direction":"delay drawer progress and verify opening contact","recoverability":"repairable","explanation":"template"}',
+            hypothetical_failure="drawer progression is predicted too early",
+            counterfactual_future="delay drawer progress until opening contact is verified",
         )
     if mismatch_type == "object_displacement_overestimated":
         return MemoryReflectionDecision(
@@ -1719,6 +1731,8 @@ def template_postexec_reflection_decision(
             recoverability="repairable",
             explanation="The future likely overestimates block displacement; require stronger contact before motion.",
             raw_text='{"trust_score":0.2,"mismatch_type":"object_displacement_overestimated","correction_direction":"reduce predicted object motion and strengthen lateral contact","recoverability":"repairable","explanation":"template"}',
+            hypothetical_failure="object motion is overestimated",
+            counterfactual_future="keep motion small and strengthen contact first",
         )
     if mismatch_type == "contact_not_realized":
         return MemoryReflectionDecision(
@@ -1728,6 +1742,8 @@ def template_postexec_reflection_decision(
             recoverability="repairable",
             explanation="The lift future is unreliable until contact is firmly established.",
             raw_text='{"trust_score":0.2,"mismatch_type":"contact_not_realized","correction_direction":"stabilize contact before lift","recoverability":"repairable","explanation":"template"}',
+            hypothetical_failure="contact is not yet established",
+            counterfactual_future="stabilize contact before attempting lift",
         )
     if mismatch_type == "wrong_object_identity":
         return MemoryReflectionDecision(
@@ -1737,6 +1753,8 @@ def template_postexec_reflection_decision(
             recoverability="repairable",
             explanation="The future likely confuses object relation; re-align before stacking.",
             raw_text='{"trust_score":0.15,"mismatch_type":"wrong_object_identity","correction_direction":"preserve object identity and align grasp before stacking","recoverability":"repairable","explanation":"template"}',
+            hypothetical_failure="object identity may be confused",
+            counterfactual_future="re-align grasp and preserve object identity",
         )
     if success:
         trust = 0.6 if steps > max(ep_len // 2, 1) else 0.75
@@ -1747,6 +1765,8 @@ def template_postexec_reflection_decision(
             recoverability="uncertain",
             explanation="The step succeeded but was not fully clean; keep progress and avoid aggressive future changes.",
             raw_text='{"trust_score":0.6,"mismatch_type":"slow_success","correction_direction":"be conservative and preserve verified progress","recoverability":"uncertain","explanation":"template"}',
+            hypothetical_failure="over-aggressive continuation may lose verified progress",
+            counterfactual_future="preserve verified progress and avoid aggressive changes",
         )
     return MemoryReflectionDecision(
         trust_score=0.2,
@@ -1755,6 +1775,8 @@ def template_postexec_reflection_decision(
         recoverability="repairable",
         explanation="The executed step failed; the next future should be more conservative and grounded in verified progress.",
         raw_text='{"trust_score":0.2,"mismatch_type":"future_outcome_mismatch","correction_direction":"stabilize contact and reduce over-optimistic future progress","recoverability":"repairable","explanation":"template"}',
+        hypothetical_failure="future outcome looks too optimistic",
+        counterfactual_future="stabilize contact and reduce over-optimistic progress",
     )
 
 

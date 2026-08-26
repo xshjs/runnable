@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
+from pathlib import Path, PosixPath
 from typing import Any
 
 import torch
@@ -54,7 +54,16 @@ def load_model(model_path: Path, device: torch.device, lora_path: Path | None) -
         torch_dtype=dtype,
     )
     if lora_path is not None:
-        checkpoint = torch.load(lora_path, map_location="cpu")
+        try:
+            try:
+                torch.serialization.add_safe_globals([Path, PosixPath])
+            except Exception:
+                pass
+            checkpoint = torch.load(lora_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            checkpoint = torch.load(lora_path, map_location="cpu")
+        except Exception:
+            checkpoint = torch.load(lora_path, map_location="cpu", weights_only=False)
         train_args = dict(checkpoint.get("args", {}))
         replace_linear_with_lora(
             model,
@@ -74,6 +83,9 @@ def generate_reflection(tokenizer: Any, model: Any, prompt: str, max_new_tokens:
         **tokens,
         max_new_tokens=max_new_tokens,
         do_sample=False,
+        temperature=None,
+        top_p=None,
+        top_k=None,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )

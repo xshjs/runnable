@@ -1,4 +1,9 @@
 from typing import Dict, List
+import os
+
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("USE_FLAX", "0")
 
 import torch
 import torch.nn as nn
@@ -79,12 +84,18 @@ class UncontrolledDINOLatentActionModel(nn.Module):
         # )
 
         # Load T5 text encoder model
-        self.text_encoder = T5EncoderModel.from_pretrained(t5_model_path)
+        self.text_encoder = T5EncoderModel.from_pretrained(
+            t5_model_path,
+            local_files_only=True,
+        )
         self.text_encoder.requires_grad_(False)
         self.lang_proj = nn.Linear(768, model_dim)
 
         # Load T5 tokenizer
-        self.tokenizer = T5Tokenizer.from_pretrained(t5_model_path)
+        self.tokenizer = T5Tokenizer.from_pretrained(
+            t5_model_path,
+            local_files_only=True,
+        )
 
     def encode_text(self, lang: List):
         # Tokenize the batch with padding to the longest sequence

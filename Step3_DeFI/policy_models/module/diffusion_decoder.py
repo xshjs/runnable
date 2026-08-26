@@ -164,6 +164,18 @@ class DiffusionTransformer(nn.Module):
         ).to(self.device)
 
         self.action_emb = nn.Linear(action_dim, embed_dim)
+        self.decoder_action_intent_proj = nn.Sequential(
+            nn.LayerNorm(goal_dim),
+            nn.Linear(goal_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+        self.decoder_action_intent_film = nn.Sequential(
+            nn.LayerNorm(goal_dim),
+            nn.Linear(goal_dim, embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim * 2),
+        )
 
         if linear_output:
             self.action_pred = nn.Linear(embed_dim, self.action_dim)
@@ -197,17 +209,17 @@ class DiffusionTransformer(nn.Module):
 
     def forward(self, states, 
                 latent_motion_tokens_up, 
-                actions, goals, sigma, uncond: Optional[bool] = False):
+                actions, goals, sigma, uncond: Optional[bool] = False, action_intent_cond=None):
         # encoder用于注入language作为condition, decoder用于交互来生成动作
         context = self.forward_enc_only(states,
                                         latent_motion_tokens_up,  
-                                        actions, goals, sigma, uncond)  # torch.Size([28, 225, 384])
-        pred_actions = self.forward_dec_only(context, actions, sigma)  # torch.Size([28, 10, 7])
+                                        actions, goals, sigma, uncond, action_intent_cond=action_intent_cond)  # torch.Size([28, 225, 384])
+        pred_actions = self.forward_dec_only(context, actions, sigma, action_intent_cond=action_intent_cond)  # torch.Size([28, 10, 7])
         return pred_actions
 
     def forward_enc_only(self, states, 
                          latent_motion_tokens_up, 
-                         actions=None, goals=None, sigma=None, uncond: Optional[bool] = False):
+                         actions=None, goals=None, sigma=None, uncond: Optional[bool] = False, action_intent_cond=None):
         emb_t = self.process_sigma_embeddings(sigma) if not self.use_ada_conditioning else None  # None
         goals = self.preprocess_goals(goals, states['state_images'].size(1), uncond)  # torch.Size([28, 1, 512])
         state_embed, proprio_embed = self.process_state_embeddings(states)  # torch.Size([28, 224, 384]) None
@@ -226,10 +238,17 @@ class DiffusionTransformer(nn.Module):
         self.latent_encoder_emb = context
         return context
 
-    def forward_dec_only(self, context, actions, sigma):
+    def forward_dec_only(self, context, actions, sigma, action_intent_cond=None):
         emb_t = self.process_sigma_embeddings(sigma)  # torch.Size([28, 1, 384])
         action_embed = self.action_emb(actions)  # torch.Size([28, 10, 7]) -> torch.Size([28, 10, 384])
         action_x = self.drop(action_embed)
+        if action_intent_cond is not None:
+            action_intent_cond = self.preprocess_action_intent_cond(action_intent_cond, action_x.size(0), action_x.device, action_x.dtype)
+            intent_token = self.decoder_action_intent_proj(action_intent_cond)
+            gamma_beta = self.decoder_action_intent_film(action_intent_cond)
+            gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+            emb_t = emb_t + intent_token
+            action_x = action_x * (1.0 + gamma) + beta
 
         x = self.decoder(action_x, emb_t, context)  # torch.Size([28, 10, 384])
         pred_actions = self.action_pred(x)  # torch.Size([28, 10, 7])
@@ -268,6 +287,19 @@ class DiffusionTransformer(nn.Module):
     def process_goal_embeddings(self, goals):
         goal_embed = self.lang_emb(goals)
         return goal_embed
+
+    def preprocess_action_intent_cond(self, action_intent_cond, batch_size, device, dtype):
+        if not torch.is_tensor(action_intent_cond):
+            action_intent_cond = torch.as_tensor(action_intent_cond, device=device, dtype=dtype)
+        else:
+            action_intent_cond = action_intent_cond.to(device=device, dtype=dtype)
+        if action_intent_cond.dim() == 2:
+            action_intent_cond = action_intent_cond.unsqueeze(1)
+        if action_intent_cond.shape[0] == 1 and batch_size != 1:
+            action_intent_cond = action_intent_cond.expand(batch_size, -1, -1)
+        elif action_intent_cond.shape[0] != batch_size:
+            raise ValueError(f"expected action_intent_cond batch {batch_size}, got {action_intent_cond.shape[0]}")
+        return action_intent_cond
 
     def apply_position_embeddings(self, goal_embed, state_embed, action_embed, proprio_embed, t):
         pos_len = t + self.goal_seq_len + self.action_seq_len - 1
