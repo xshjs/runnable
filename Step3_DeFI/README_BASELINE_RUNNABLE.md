@@ -277,14 +277,14 @@ Current recommended checkpoints for real-hardware bring-up:
 - `pen` secondary:
   - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt`
 - `cups` primary:
-  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
-- `cups` secondary:
-  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt`
+  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt`
+- `cups` source run:
+  - `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-28_21-18-37/saved_models/best_val.pt`
 
 Current recommendation for first real-hardware rollout:
 
 - `pen`: start from `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt`
-- `cups`: start from `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
+- `cups`: start from `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt`
 
 Export `pen` primary ckpt to `raw + ee + joint`:
 
@@ -336,8 +336,10 @@ Export `cups` primary ckpt:
 cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
 
 python scripts/export_x5_action_from_ckpt.py \
-  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
-  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --config_name VPP_Calvinabc_train_joint_action \
+  --action_format joint_absolute \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_joint_action \
   --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
   --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
   --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
@@ -345,36 +347,18 @@ python scripts/export_x5_action_from_ckpt.py \
   --split validation \
   --sample_index 0 \
   --export_mode all \
-  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
-  --episode_index 0 \
-  --frame_index 0 \
-  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
-  --binary_gripper
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf
 ```
 
-Export `cups` secondary ckpt:
+Export `cups` with the helper script:
 
 ```bash
 cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
 
-python scripts/export_x5_action_from_ckpt.py \
-  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt \
-  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
-  --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
-  --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
-  --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
-  --language_goal_path /mnt/data/xiyin/manipulation/DeFi/ckpts/ViT-B-32.pt \
-  --split validation \
-  --sample_index 0 \
-  --export_mode all \
-  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
-  --episode_index 0 \
-  --frame_index 0 \
-  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
-  --binary_gripper
+bash scripts/export_x5_stack_cups_best.sh
 ```
 
-The generated outputs are written under each shared dataset folder:
+The generated outputs are written under each shared dataset folder. For the current `cups` joint-action path, the helper script writes to `x5_exports_best_val_joint_action`:
 
 - `x5_exports/validation_sample_00000_raw.npy`
 - `x5_exports/validation_sample_00000_ee.npy`
@@ -413,8 +397,10 @@ python scripts/export_x5_action_from_ckpt.py \
 cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
 
 python scripts/export_x5_action_from_ckpt.py \
-  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
-  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --config_name VPP_Calvinabc_train_joint_action \
+  --action_format joint_absolute \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_joint_action \
   --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
   --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
   --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
@@ -422,7 +408,7 @@ python scripts/export_x5_action_from_ckpt.py \
   --split validation \
   --sample_index 0 \
   --export_mode ee \
-  --binary_gripper
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf
 ```
 
 If the execution side consumes joint deltas, run the `all` export and use the generated `joint.npy`.
@@ -455,8 +441,10 @@ python scripts/export_x5_action_from_ckpt.py \
 cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
 
 python scripts/export_x5_action_from_ckpt.py \
-  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
-  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --config_name VPP_Calvinabc_train_joint_action \
+  --action_format joint_absolute \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_joint_action \
   --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
   --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
   --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
@@ -464,24 +452,20 @@ python scripts/export_x5_action_from_ckpt.py \
   --split validation \
   --sample_index 0 \
   --export_mode all \
-  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
-  --episode_index 0 \
-  --frame_index 0 \
-  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
-  --binary_gripper
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf
 ```
 
 Expected rollout files:
 
 - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/x5_exports/validation_sample_00000_ee.npy`
 - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/x5_exports/validation_sample_00000_joint.npy`
-- `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/x5_exports/validation_sample_00000_ee.npy`
-- `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/x5_exports/validation_sample_00000_joint.npy`
+- `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/x5_exports_best_val_joint_action/validation_sample_00000_ee.npy`
+- `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/x5_exports_best_val_joint_action/validation_sample_00000_joint.npy`
 
-Known-good status as of August 26, 2026:
+Known-good status as of August 29, 2026:
 
 - `pen` `epoch_002.pt` has already been verified to export successfully
-- `cups` `epoch_004.pt` has already been verified to export successfully
+- `cups` `best_val.pt` has already been verified to export successfully
 - older checkpoints may print `missing_keys: ["model.action_dim_weights"]`
 - that missing-key message is expected for inference and does not block export
 

@@ -16,11 +16,8 @@ This file lists the minimal code and checkpoint recommendations for the X5 real-
   - shared path: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt`
   - source path: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_19-44-39/saved_models/best_val.pt`
 - `stack_cups` primary:
-  - shared path: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
-  - source path: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_09-47-55/saved_models/epoch_004.pt`
-- `stack_cups` secondary:
-  - shared path: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt`
-  - source path: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-25_09-47-55/saved_models/epoch_007.pt`
+  - shared path: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt`
+  - source path: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-28_21-18-37/saved_models/best_val.pt`
 
 ## Shared ckpt placement
 
@@ -29,7 +26,7 @@ For collaborator handoff, place the four selected checkpoints into the original 
 - `pen` checkpoints under `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403`
 - `cups` checkpoints under `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133`
 
-The X5 export script writes rollout-ready files under each shared folder:
+The X5 export script writes rollout-ready files under each shared folder. For the current `cups` joint-action path, use `x5_exports_best_val_joint_action`:
 
 - `x5_exports/validation_sample_00000_raw.npy`
 - `x5_exports/validation_sample_00000_ee.npy`
@@ -118,8 +115,10 @@ python scripts/export_x5_action_from_ckpt.py \
 cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
 
 python scripts/export_x5_action_from_ckpt.py \
-  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
-  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --config_name VPP_Calvinabc_train_joint_action \
+  --action_format joint_absolute \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_joint_action \
   --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
   --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
   --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
@@ -127,11 +126,7 @@ python scripts/export_x5_action_from_ckpt.py \
   --split validation \
   --sample_index 0 \
   --export_mode all \
-  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
-  --episode_index 0 \
-  --frame_index 0 \
-  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
-  --binary_gripper
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf
 ```
 
 ## Note on `action_dim_weights`

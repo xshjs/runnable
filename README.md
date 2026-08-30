@@ -54,8 +54,8 @@ For the current X5 real-robot runnable path, the same base checkpoints are used 
 
 - `pen`: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/epoch_002.pt`
 - `pen` alternative: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt`
-- `cups`: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
-- `cups` alternative: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt`
+- `cups`: `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt`
+- `cups` source run: `/mnt/data/xiyin/manipulation/DeFi/outputs/calvin_train/2026-08-28_21-18-37/saved_models/best_val.pt`
 
 </details>
 
@@ -113,7 +113,7 @@ Download the Calvin ABC-D dataset from follow [Calvin](https://github.com/mees/c
 For the current X5 real-robot runnable path, the converted DeFi-format datasets are:
 
 - `pen`: `/mnt/workspace/manipulation/datasets/defi_x5_left_pen_tape_cutter_tray_fk_ee_offset5`
-- `cups`: `/mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5`
+- `cups`: `/mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_joint_action`
 
 </details>
 
@@ -181,7 +181,7 @@ Train `cups`:
 ```bash
 cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
 
-ROOT_DATA_DIR=/mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+ROOT_DATA_DIR=/mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_joint_action \
 VIDEO_MODEL_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
 TEXT_ENCODER_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
 T5_MODEL_PATH=/mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
@@ -192,7 +192,7 @@ MAX_EPOCHS=12 \
 NUM_WORKERS=12 \
 SAVE_EVERY=2000 \
 PYTHON_BIN=/mnt/data/xiyin/manipulation/DeFi/.venv/bin/python \
-bash scripts/train_calvin_real_robot.sh
+bash scripts/train_calvin_real_robot.sh --config_name VPP_Calvinabc_train_joint_action
 ```
 
 ### Step 3 export for real hardware
@@ -225,8 +225,10 @@ Export `cups` first-choice checkpoint to `raw + ee + joint`:
 cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
 
 python scripts/export_x5_action_from_ckpt.py \
-  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt \
-  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_fk_ee_offset5 \
+  --config_name VPP_Calvinabc_train_joint_action \
+  --action_format joint_absolute \
+  --ckpt /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt \
+  --root_data_dir /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_joint_action \
   --video_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/_hf_defi/step1_gfdm \
   --text_encoder_path /mnt/data/xiyin/manipulation/DeFi/ckpts/openai_clip_vit_base_patch32 \
   --t5_model_path /mnt/data/xiyin/manipulation/DeFi/ckpts/t5_base \
@@ -234,11 +236,7 @@ python scripts/export_x5_action_from_ckpt.py \
   --split validation \
   --sample_index 0 \
   --export_mode all \
-  --raw_dataset_root /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133 \
-  --episode_index 0 \
-  --frame_index 0 \
-  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf \
-  --binary_gripper
+  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf
 ```
 
 For real-hardware rollout, use the generated `ee.npy` first unless the execution side explicitly requires joint deltas.
@@ -261,18 +259,18 @@ The original environment, checkpoint, and Stage 1/2/3 sections above remain the 
 - `pen` second-choice:
   - `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/best_val.pt`
 - `cups` first-choice:
-  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_004.pt`
-- `cups` second-choice:
-  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/epoch_007.pt`
+  - `/mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/best_val.pt`
 
-As of August 26, 2026, the following export paths have already been verified to run successfully:
+As of August 30, 2026, the following export paths have already been verified to run successfully:
 
 - `pen` `epoch_002.pt`
-- `cups` `epoch_004.pt`
+- `cups` `best_val.pt` from the August 29, 2026 run
 
 ### What the model outputs
 
-The Step3 DeFi action head predicts normalized 7D relative actions:
+For the current `cups` joint-action run, the Step3 action head predicts 7D X5 joint + gripper sequences directly.
+
+Older DeFi checkpoints can still predict normalized 7D relative actions:
 
 - dim `0:3`: normalized EE `delta_xyz`
 - dim `3:6`: normalized EE `delta_euler_xyz`
@@ -289,10 +287,10 @@ For current X5 integration, prefer `ee.npy` first.
 
 The export commands above write results under each shared folder:
 
-- `x5_exports/validation_sample_00000_raw.npy`
-- `x5_exports/validation_sample_00000_ee.npy`
-- `x5_exports/validation_sample_00000_joint.npy`
-- `x5_exports/validation_sample_00000_summary.json`
+- `x5_exports_best_val_joint_action/validation_sample_00000_raw.npy`
+- `x5_exports_best_val_joint_action/validation_sample_00000_ee.npy`
+- `x5_exports_best_val_joint_action/validation_sample_00000_joint.npy`
+- `x5_exports_best_val_joint_action/validation_sample_00000_summary.json`
 
 ### Current training setup
 
