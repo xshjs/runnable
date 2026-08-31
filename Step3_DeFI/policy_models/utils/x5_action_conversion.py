@@ -39,6 +39,8 @@ def convert_rel_action_to_x5_ee(
     max_pos: float = 0.05,
     max_orn: float = 0.50,
     binary_gripper: bool = False,
+    gripper_close_value: float = -1.0,
+    gripper_open_value: float = 1.0,
 ) -> np.ndarray:
     # This is the direct denormalization path used when the execution side accepts EE deltas.
     actions = np.asarray(actions, dtype=np.float32)
@@ -49,6 +51,11 @@ def convert_rel_action_to_x5_ee(
     out[..., 3:6] = np.clip(out[..., 3:6], -1.0, 1.0) * max_orn
     if binary_gripper:
         out[..., 6] = np.where(out[..., 6] > 0.0, 1.0, -1.0)
+    else:
+        if gripper_open_value < gripper_close_value:
+            raise ValueError("gripper_open_value must be >= gripper_close_value")
+        norm01 = (np.clip(out[..., 6], -1.0, 1.0) + 1.0) * 0.5
+        out[..., 6] = gripper_close_value + norm01 * (gripper_open_value - gripper_close_value)
     return out
 
 
@@ -172,6 +179,8 @@ def convert_rel_action_to_x5_joint(
     jac_eps: float = 1e-4,
     max_joint_delta: float = 0.05,
     binary_gripper: bool = False,
+    gripper_close_value: float = -1.0,
+    gripper_open_value: float = 1.0,
 ) -> np.ndarray:
     # This path approximates EE->joint conversion with a numerical Jacobian around the current joint state.
     actions = np.asarray(actions, dtype=np.float64)
@@ -197,5 +206,11 @@ def convert_rel_action_to_x5_joint(
         dq = _damped_ls_solve(jac, ee_delta, damping)
         dq = np.clip(dq, -max_joint_delta, max_joint_delta)
         out[i, :6] = dq
-        out[i, 6] = 1.0 if (a[6] > 0.0 and binary_gripper) else (-1.0 if binary_gripper else a[6])
+        if binary_gripper:
+            out[i, 6] = 1.0 if a[6] > 0.0 else -1.0
+        else:
+            if gripper_open_value < gripper_close_value:
+                raise ValueError("gripper_open_value must be >= gripper_close_value")
+            norm01 = (float(np.clip(a[6], -1.0, 1.0)) + 1.0) * 0.5
+            out[i, 6] = gripper_close_value + norm01 * (gripper_open_value - gripper_close_value)
     return out.reshape(actions.shape).astype(np.float32)

@@ -225,11 +225,17 @@ def _normalize_quat_xyzw(quat: np.ndarray) -> np.ndarray:
     return quat.astype(np.float32)
 
 
-def _gripper_value(raw: float, mode: str) -> np.float32:
+def _gripper_value(raw: float, mode: str, gripper_min: float, gripper_max: float) -> np.float32:
     if mode == "raw":
         return np.float32(raw)
     if mode == "binary_signed":
         return np.float32(1.0 if raw > 0.5 else -1.0)
+    if mode == "continuous_range":
+        if gripper_max <= gripper_min:
+            raise ValueError("--gripper_max must be greater than --gripper_min")
+        clipped = min(max(float(raw), float(gripper_min)), float(gripper_max))
+        norm01 = (clipped - float(gripper_min)) / (float(gripper_max) - float(gripper_min))
+        return np.float32(norm01 * 2.0 - 1.0)
     raise ValueError(f"Unsupported gripper mode: {mode}")
 
 
@@ -242,6 +248,8 @@ def _build_delta_pose_gripper_action(
     max_pos: float,
     max_orn: float,
     gripper_mode: str,
+    gripper_min: float,
+    gripper_max: float,
 ) -> np.ndarray:
     if max_pos <= 0.0 or max_orn <= 0.0:
         raise ValueError("--max_pos and --max_orn must be positive for delta action conversion")
@@ -251,7 +259,10 @@ def _build_delta_pose_gripper_action(
     target_euler = R.from_quat(_normalize_quat_xyzw(target_pose[3:7])).as_euler("xyz", degrees=False)
     rel_pos = np.clip(target_pose[:3] - curr_pose[:3], -max_pos, max_pos) / max_pos
     rel_orn = np.clip(_angle_wrap(target_euler - curr_euler), -max_orn, max_orn) / max_orn
-    gripper = np.asarray([_gripper_value(float(action[action_gripper_idx]), gripper_mode)], dtype=np.float32)
+    gripper = np.asarray(
+        [_gripper_value(float(action[action_gripper_idx]), gripper_mode, gripper_min, gripper_max)],
+        dtype=np.float32,
+    )
     return np.concatenate([rel_pos, rel_orn, gripper], axis=0).astype(np.float32)
 
 
@@ -283,7 +294,12 @@ def _build_pose_gripper_robot_obs_from_pose(
 
 
 def _build_joint_robot_obs(state: np.ndarray, state_dim: int) -> np.ndarray:
-    return _pad_slice(state, state_dim)
+    robot_obs = _pad_slice(state, state_dim)
+    # Keep compatibility with the existing CALVIN proprio slicing, which expects
+    # the gripper scalar to also live at robot_obs[14].
+    if state_dim >= 15 and state.shape[0] >= 7:
+        robot_obs[14] = np.float32(state[6])
+    return robot_obs
 
 
 def _build_joint_delta_action(
@@ -292,6 +308,8 @@ def _build_joint_delta_action(
     action_dim: int,
     max_joint_delta: float,
     gripper_mode: str,
+    gripper_min: float,
+    gripper_max: float,
 ) -> np.ndarray:
     if action_dim < 1:
         raise ValueError("--action_dim must be >= 1")
@@ -303,7 +321,9 @@ def _build_joint_delta_action(
         delta = np.asarray(future_state[:joint_dims] - state[:joint_dims], dtype=np.float32)
         rel[:joint_dims] = np.clip(delta / max_joint_delta, -1.0, 1.0)
     if action_dim <= int(state.shape[0]) and action_dim <= int(future_state.shape[0]):
-        rel[action_dim - 1] = _gripper_value(float(future_state[action_dim - 1]), gripper_mode)
+        rel[action_dim - 1] = _gripper_value(
+            float(future_state[action_dim - 1]), gripper_mode, gripper_min, gripper_max
+        )
     return rel
 
 
@@ -380,6 +400,8 @@ def _build_fk_delta_pose_gripper_action(
     max_pos: float,
     max_orn: float,
     gripper_mode: str,
+    gripper_min: float,
+    gripper_max: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     curr_pose = _fk_pose_xyzw(fk_chain, curr_state[:6])
     future_pose = _fk_pose_xyzw(fk_chain, future_state[:6])
@@ -387,7 +409,10 @@ def _build_fk_delta_pose_gripper_action(
     future_euler = R.from_quat(_normalize_quat_xyzw(future_pose[3:7])).as_euler("xyz", degrees=False)
     rel_pos = np.clip(future_pose[:3] - curr_pose[:3], -max_pos, max_pos) / max_pos
     rel_orn = np.clip(_angle_wrap(future_euler - curr_euler), -max_orn, max_orn) / max_orn
-    gripper = np.asarray([_gripper_value(float(future_state[6]), gripper_mode)], dtype=np.float32)
+    gripper = np.asarray(
+        [_gripper_value(float(future_state[6]), gripper_mode, gripper_min, gripper_max)],
+        dtype=np.float32,
+    )
     return curr_pose, np.concatenate([rel_pos, rel_orn, gripper], axis=0).astype(np.float32)
 
 
@@ -423,9 +448,12 @@ def _write_split(
     max_joint_delta: float,
     future_state_offset: int,
     gripper_mode: str,
+    gripper_min: float,
+    gripper_max: float,
     fk_chain: list[dict] | None,
     resize: int | None,
     frame_stride: int,
+    skip_broken_episodes: bool,
 ) -> dict:
     split_dir.mkdir(parents=True, exist_ok=True)
     ranges: list[tuple[int, int]] = []
@@ -450,14 +478,24 @@ def _write_split(
         start = out_index
         sampled_rows = rows[::frame_stride]
         sampled_global_indices = [int(row["index"]) for row in sampled_rows]
-        left_frames = _read_video_frames_by_global_indices(left_videos, sampled_global_indices, resize)
-        right_frames = _read_video_frames_by_global_indices(right_videos, sampled_global_indices, resize)
+        try:
+            left_frames = _read_video_frames_by_global_indices(left_videos, sampled_global_indices, resize)
+            right_frames = _read_video_frames_by_global_indices(right_videos, sampled_global_indices, resize)
+        except Exception as exc:
+            if not skip_broken_episodes:
+                raise
+            print(
+                f"[convert] split={split_dir.name} episode={episode_id} skipped due to video read failure: {exc}",
+                flush=True,
+            )
+            continue
         for row_idx, row in enumerate(sampled_rows):
             global_index = int(row["index"])
             task_text = tasks.get(row["task_index"], "perform the task")
+            raw_action = _safe_slice(row["action"], action_dim, "action")
             if action_mode == "raw_slice":
                 robot_obs = _build_joint_robot_obs(row["state"], state_dim)
-                rel_actions = _safe_slice(row["action"], action_dim, "action")
+                rel_actions = raw_action
             elif action_mode == "joint_delta":
                 robot_obs = _build_joint_robot_obs(row["state"], state_dim)
                 future_row = sampled_rows[min(row_idx + future_state_offset, len(sampled_rows) - 1)]
@@ -467,6 +505,8 @@ def _write_split(
                     action_dim,
                     max_joint_delta,
                     gripper_mode,
+                    gripper_min,
+                    gripper_max,
                 )
             elif action_mode == "fk_delta_pose_gripper":
                 if fk_chain is None:
@@ -479,6 +519,8 @@ def _write_split(
                     max_pos,
                     max_orn,
                     gripper_mode,
+                    gripper_min,
+                    gripper_max,
                 )
                 robot_obs = _build_pose_gripper_robot_obs_from_pose(
                     curr_pose,
@@ -501,6 +543,8 @@ def _write_split(
                     max_pos,
                     max_orn,
                     gripper_mode,
+                    gripper_min,
+                    gripper_max,
                 )
             else:
                 raise ValueError(f"Unsupported action mode: {action_mode}")
@@ -510,6 +554,7 @@ def _write_split(
                 rgb_gripper=right_frames[global_index],
                 robot_obs=robot_obs,
                 scene_obs=np.zeros((1,), dtype=np.float32),
+                actions=raw_action,
                 rel_actions=rel_actions,
             )
             out_index += 1
@@ -562,14 +607,17 @@ def main() -> None:
     parser.add_argument("--future_state_offset", type=int, default=1, help="For joint_delta, use state[t+offset] - state[t]")
     parser.add_argument(
         "--gripper_mode",
-        choices=["binary_signed", "raw"],
+        choices=["binary_signed", "raw", "continuous_range"],
         default="binary_signed",
-        help="binary_signed maps >0.5 to 1 else -1; raw preserves the source gripper scalar.",
+        help="binary_signed maps >0.5 to 1 else -1; raw preserves the source gripper scalar; continuous_range linearly maps [gripper_min, gripper_max] to [-1, 1].",
     )
+    parser.add_argument("--gripper_min", type=float, default=-3.5, help="Closed gripper value for continuous_range normalization.")
+    parser.add_argument("--gripper_max", type=float, default=0.0, help="Open gripper value for continuous_range normalization.")
     parser.add_argument("--static_video_key", default="observation.images.cam_left", help="Source video feature mapped to rgb_static")
     parser.add_argument("--gripper_video_key", default="observation.images.cam_right", help="Source video feature mapped to rgb_gripper")
     parser.add_argument("--resize", type=int, default=224, help="Output square RGB size; set <=0 to keep source")
     parser.add_argument("--frame_stride", type=int, default=1)
+    parser.add_argument("--skip_broken_episodes", action="store_true", help="Skip episodes whose source videos are truncated/corrupted.")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -611,9 +659,12 @@ def main() -> None:
         "max_joint_delta": args.max_joint_delta,
         "future_state_offset": args.future_state_offset,
         "gripper_mode": args.gripper_mode,
+        "gripper_min": args.gripper_min,
+        "gripper_max": args.gripper_max,
         "static_video_key": args.static_video_key,
         "gripper_video_key": args.gripper_video_key,
         "frame_stride": args.frame_stride,
+        "skip_broken_episodes": bool(args.skip_broken_episodes),
         "train": _write_split(
             output_root / "training",
             source_root,
@@ -633,9 +684,12 @@ def main() -> None:
             args.max_joint_delta,
             args.future_state_offset,
             args.gripper_mode,
+            args.gripper_min,
+            args.gripper_max,
             fk_chain,
             resize,
             args.frame_stride,
+            args.skip_broken_episodes,
         ),
         "validation": _write_split(
             output_root / "validation",
@@ -656,9 +710,12 @@ def main() -> None:
             args.max_joint_delta,
             args.future_state_offset,
             args.gripper_mode,
+            args.gripper_min,
+            args.gripper_max,
             fk_chain,
             resize,
             args.frame_stride,
+            args.skip_broken_episodes,
         ),
     }
     (output_root / "conversion_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
