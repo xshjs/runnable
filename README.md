@@ -155,6 +155,26 @@ scripts/rollout_calvin.sh
 
 The following commands are additive examples for the current X5 real-robot setup. They do not replace the original Stage 1/2/3 pipeline above.
 
+### Convert processed X5 data
+
+Convert the processed `cups` LeRobot-style data into DeFi npz format. The current joint-action setup keeps `action[:7]` directly, including the continuous gripper value.
+
+```bash
+cd /mnt/workspace/manipulation/DeFi/Step3_DeFI
+
+python scripts/convert_lerobot_v30_to_defi_real_robot.py \
+  --input /mnt/data/shared/hxw/datasets/processed/x5_left_stack_cups_0824_1133 \
+  --output /mnt/workspace/manipulation/datasets/defi_x5_left_stack_cups_joint_action \
+  --action_mode raw_slice \
+  --state_dim 15 \
+  --action_dim 7 \
+  --static_video_key observation.images.third_person \
+  --gripper_video_key observation.images.wrist \
+  --gripper_mode raw \
+  --skip_broken_episodes \
+  --overwrite
+```
+
 ### Step 3 training
 
 Train `pen`:
@@ -236,7 +256,8 @@ python scripts/export_x5_action_from_ckpt.py \
   --split validation \
   --sample_index 0 \
   --export_mode all \
-  --urdf /tmp/arx_x5_sdk_src/arx_x5_sdk-0.1.7/arx_x5_sdk/urdf/x5_2025.urdf
+  --urdf /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/x5_2025.urdf \
+  --output_dir /mnt/data/shared/hxw/x5_left_stack_cups_0824_1133/x5_exports_best_val_joint_action
 ```
 
 For real-hardware rollout, use the generated `ee.npy` first unless the execution side explicitly requires joint deltas.
