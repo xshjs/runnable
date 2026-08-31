@@ -10,12 +10,26 @@ TEXT_ENCODER_PATH="${TEXT_ENCODER_PATH:-}"
 T5_MODEL_PATH="${T5_MODEL_PATH:-}"
 LANGUAGE_GOAL_PATH="${LANGUAGE_GOAL_PATH:-}"
 TOKEN_CKPT_PATH="${TOKEN_CKPT_PATH:-}"
+CONFIG_NAME="${CONFIG_NAME:-VPP_Calvinabc_train}"
 NUM_GPUS="${NUM_GPUS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-28}"
 MAX_EPOCHS="${MAX_EPOCHS:-12}"
 NUM_WORKERS="${NUM_WORKERS:-12}"
 SAVE_EVERY="${SAVE_EVERY:-2000}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --config_name)
+      CONFIG_NAME="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [[ -z "${ROOT_DATA_DIR}" || -z "${VIDEO_MODEL_PATH}" || -z "${TEXT_ENCODER_PATH}" || -z "${T5_MODEL_PATH}" || -z "${LANGUAGE_GOAL_PATH}" ]]; then
   cat <<'EOF'
@@ -30,6 +44,7 @@ Required:
 
 Optional:
   TOKEN_CKPT_PATH
+  CONFIG_NAME=VPP_Calvinabc_train
   NUM_GPUS=1
   BATCH_SIZE=28
   MAX_EPOCHS=12
@@ -62,6 +77,7 @@ if [[ "${NUM_GPUS}" -gt 1 ]]; then
 fi
 
 "${PYTHON_BIN}" "${LAUNCH_ARGS[@]}" "${ROOT_DIR}/scripts/train_calvin.py" \
+  --config_name "${CONFIG_NAME}" \
   --root_data_dir "${ROOT_DATA_DIR}" \
   --video_model_path "${VIDEO_MODEL_PATH}" \
   --text_encoder_path "${TEXT_ENCODER_PATH}" \

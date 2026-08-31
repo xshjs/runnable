@@ -335,11 +335,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--val_num_batches", type=int, default=20)
+    parser.add_argument("--config_name", type=str, default="VPP_Calvinabc_train")
     
     args = parser.parse_args()
     
-    with initialize(config_path="../policy_conf", job_name="VPP_Calvinabc_train"):
-        cfg = compose(config_name="VPP_Calvinabc_train")
+    with initialize(config_path="../policy_conf", job_name=args.config_name):
+        cfg = compose(config_name=args.config_name)
     cfg.model.pretrained_model_path = args.video_model_path
     cfg.model.text_encoder_path = args.text_encoder_path
     cfg.root_data_dir = args.root_data_dir
