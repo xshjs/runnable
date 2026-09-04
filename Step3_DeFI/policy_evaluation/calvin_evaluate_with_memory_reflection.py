@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from hydra import compose, initialize
-from omegaconf import open_dict
+from omegaconf import OmegaConf, open_dict
 from pytorch_lightning import seed_everything
 from tqdm.auto import tqdm
 
@@ -81,6 +81,12 @@ from policy_evaluation.train_sufficiency_mask_critic import (
 from policy_evaluation.train_joint_future_action_energy import JointFutureActionEnergy
 from policy_evaluation.train_joint_future_action_policy import JointFutureActionPolicy
 from policy_evaluation.train_joint_action_generator_mlp import JointActionGeneratorMLP
+from policy_evaluation.train_delta_action_repair_mlp import DeltaActionRepairMLP
+from policy_evaluation.train_chunk_effect_phi_mlp import ChunkEffectPhiMLP
+from policy_evaluation.train_joint_execution_update_mlp import JointExecutionUpdateMLP
+from policy_evaluation.train_suffix_trigger_mlp import SuffixTriggerMLP, build_suffix_trigger_feature
+from policy_evaluation.train_factored_belief_action_transition import BeliefTransitionMLP, ActionAdaptationMLP
+from policy_evaluation.train_future_action_dynamics_probe import FutureActionDynamicsProbe
 from policy_evaluation.train_joint_future_action_robotics_energy import JointFutureActionRoboticsEnergy
 from policy_evaluation.train_joint_hypothesis_repair import JointHypothesisRepairMLP
 from policy_evaluation.train_joint_repair_critic import JointRepairCriticMLP
@@ -114,9 +120,53 @@ RELATION_PROBE_TARGETS = ["risk", "contact", "object_motion", "progress", "goal"
 _JOINT_PAIR_SELECTOR_CACHE = {}
 _DYNAMIC_COUPLING_CACHE = {}
 _JOINT_ACTION_GENERATOR_CACHE = {}
+_DELTA_ACTION_REPAIR_CACHE = {}
+_FUTURE_ACTION_DYNAMICS_CACHE = {}
+_SUFFIX_TRIGGER_CACHE = {}
 _SUMMARY_FUTURE_ADAPTER_CACHE = {}
+_JOINT_EXECUTION_UPDATE_CACHE = {}
 _JOINT_REPAIR_RUNTIME_CACHE = {}
 _JOINT_VALUE_RUNTIME_CACHE = {}
+
+
+def _apply_checkpoint_model_compat_overrides(cfg, checkpoint_path: str) -> None:
+    """
+    Old Step3 DeFI checkpoints may have been trained with a different action
+    chunk length / latent count than the current default config. Read the
+    checkpoint training args and override the runtime config before model
+    instantiation so loading stays shape-compatible.
+    """
+    if not checkpoint_path:
+        return
+    ckpt = Path(checkpoint_path)
+    if not ckpt.exists():
+        return
+    try:
+        state = torch.load(str(ckpt), map_location="cpu")
+    except Exception as exc:
+        print(f"[WARN] Failed to inspect checkpoint for compat overrides: {exc}", flush=True)
+        return
+    train_args = state.get("args")
+    if train_args is None:
+        return
+    if not isinstance(train_args, dict):
+        train_args = OmegaConf.to_container(train_args, resolve=True)
+    if not isinstance(train_args, dict):
+        return
+
+    act_seq_len = train_args.get("act_seq_len", train_args.get("action_seq_len"))
+    num_latents = train_args.get("num_latents")
+    with open_dict(cfg):
+        if act_seq_len is not None:
+            act_seq_len = int(act_seq_len)
+            cfg.act_seq_len = act_seq_len
+            cfg.model.action_seq_len = act_seq_len
+            cfg.model.act_window_size = act_seq_len
+            cfg.model.multistep = act_seq_len
+            print(f"[INFO] Applied checkpoint act_seq_len override: {act_seq_len}", flush=True)
+        if num_latents is not None:
+            cfg.model.num_latents = int(num_latents)
+            print(f"[INFO] Applied checkpoint num_latents override: {int(num_latents)}", flush=True)
 
 
 def maybe_make_online_acceptance_row(row):
@@ -206,7 +256,7 @@ def load_dynamic_coupling_operator(cfg, device):
         history_len=int(ckpt["history_len"]),
         dropout=float(ckpt.get("dropout", 0.1)),
     ).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
     model.eval()
     bundle = {
         "model": model,
@@ -243,6 +293,39 @@ def _build_dynamic_coupling_history_actions(recent_actions, history_len: int, ch
         hist[i] = chunk_arr
         mask[i] = 1.0
     return hist, mask
+
+
+def _coupled_future_delta_from_committed(
+    target_key: str,
+    dt: torch.Tensor,
+    committed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Internal structural bias for the coupled correction operator.
+
+    We do not treat committed effect as an external module in the execution path.
+    Instead, correction is parameterized through:
+
+      d_committed = C_theta(s, H, z_a)
+      delta_z_f   = f_theta(d_target - d_committed)
+
+    and the caller applies:
+
+      z_f' = z_f + delta_z_f
+    """
+    if target_key in {"pending_effect", "residual_to_target"}:
+        d_committed = dt - committed
+        delta_z_f = committed
+    elif target_key == "observed_effect":
+        d_committed = committed
+        delta_z_f = dt - committed
+    elif target_key == "residual_before":
+        d_committed = torch.zeros_like(committed)
+        delta_z_f = committed
+    else:
+        d_committed = committed
+        delta_z_f = dt - d_committed
+    return d_committed, delta_z_f
 
 
 def apply_dynamic_coupling_future(
@@ -363,19 +446,8 @@ def apply_dynamic_coupling_future(
 
         if vector_mode:
             dt = (target_t - base_t).reshape(-1)
-            if target_key in {"pending_effect", "residual_to_target"}:
-                d_committed = dt - committed
-                d_need = committed
-            elif target_key == "observed_effect":
-                d_committed = committed
-                d_need = dt - committed
-            elif target_key == "residual_before":
-                d_committed = torch.zeros_like(committed)
-                d_need = committed
-            else:
-                d_committed = committed
-                d_need = dt - d_committed
-            corrected_summary_t = base_t.reshape(-1) + d_need
+            d_committed, delta_z_f = _coupled_future_delta_from_committed(target_key, dt, committed)
+            corrected_summary_t = base_t.reshape(-1) + delta_z_f
             corrected_summary_exec = corrected_summary_t.detach().cpu().numpy().astype(np.float32)
             if committed_norm < min_committed:
                 return slow_target_future, None, {
@@ -383,10 +455,11 @@ def apply_dynamic_coupling_future(
                     "dynamic_coupling_applied": False,
                     "dynamic_coupling_reason": f"committed_norm<{min_committed:g}",
                     "dynamic_coupling_vector_mode": True,
+                    "dynamic_coupling_internal_bias": "delta_z_f=f_theta(d_target-d_committed)",
                     "dynamic_coupling_target_key": target_key,
                     "dynamic_coupling_committed_norm": committed_norm,
                     "dynamic_coupling_dt_norm": float(torch.norm(dt, p=2).item()),
-                    "dynamic_coupling_dneed_norm": float(torch.norm(d_need, p=2).item()),
+                    "dynamic_coupling_dneed_norm": float(torch.norm(delta_z_f, p=2).item()),
                     "dynamic_coupling_hist_mask": hist_mask_list,
                     "dynamic_coupling_alpha_mean": alpha_list,
                     "dynamic_coupling_current_to_target_norm": baseline_gap_norm,
@@ -398,6 +471,7 @@ def apply_dynamic_coupling_future(
                     "dynamic_coupling_applied": False,
                     "dynamic_coupling_reason": "missing_summary_future_adapter",
                     "dynamic_coupling_vector_mode": True,
+                    "dynamic_coupling_internal_bias": "delta_z_f=f_theta(d_target-d_committed)",
                     "dynamic_coupling_target_key": target_key,
                     "dynamic_coupling_committed_norm": committed_norm,
                     "dynamic_coupling_hist_mask": hist_mask_list,
@@ -417,10 +491,11 @@ def apply_dynamic_coupling_future(
                         "dynamic_coupling_applied": False,
                         "dynamic_coupling_reason": str(reject_reason),
                         "dynamic_coupling_vector_mode": True,
+                        "dynamic_coupling_internal_bias": "delta_z_f=f_theta(d_target-d_committed)",
                         "dynamic_coupling_target_key": target_key,
                         "dynamic_coupling_committed_norm": committed_norm,
                         "dynamic_coupling_dt_norm": float(torch.norm(dt, p=2).item()),
-                        "dynamic_coupling_dneed_norm": float(torch.norm(d_need, p=2).item()),
+                        "dynamic_coupling_dneed_norm": float(torch.norm(delta_z_f, p=2).item()),
                         "dynamic_coupling_hist_mask": hist_mask_list,
                         "dynamic_coupling_alpha_mean": alpha_list,
                         "dynamic_coupling_current_to_target_norm": baseline_gap_norm,
@@ -431,10 +506,11 @@ def apply_dynamic_coupling_future(
                     "dynamic_coupling_used": True,
                     "dynamic_coupling_applied": True,
                     "dynamic_coupling_vector_mode": True,
+                    "dynamic_coupling_internal_bias": "delta_z_f=f_theta(d_target-d_committed)",
                     "dynamic_coupling_target_key": target_key,
                     "dynamic_coupling_committed_norm": committed_norm,
                     "dynamic_coupling_dt_norm": float(torch.norm(dt, p=2).item()),
-                    "dynamic_coupling_dneed_norm": float(torch.norm(d_need, p=2).item()),
+                    "dynamic_coupling_dneed_norm": float(torch.norm(delta_z_f, p=2).item()),
                     "dynamic_coupling_hist_mask": hist_mask_list,
                     "dynamic_coupling_alpha_mean": alpha_list,
                     "dynamic_coupling_current_to_target_norm": baseline_gap_norm,
@@ -451,6 +527,7 @@ def apply_dynamic_coupling_future(
                     "dynamic_coupling_applied": False,
                     "dynamic_coupling_reason": f"summary_future_adapter_error:{exc}",
                     "dynamic_coupling_vector_mode": True,
+                    "dynamic_coupling_internal_bias": "delta_z_f=f_theta(d_target-d_committed)",
                     "dynamic_coupling_target_key": target_key,
                     "dynamic_coupling_committed_norm": committed_norm,
                     "dynamic_coupling_hist_mask": hist_mask_list,
@@ -673,6 +750,115 @@ def apply_dynamic_coupling_candidate_prior(
             "joint_pair_coupling_prior_applied": False,
             "joint_pair_coupling_prior_reason": f"error:{exc}",
         }
+
+
+def apply_coupled_correction(
+    cfg,
+    *,
+    mode: str,
+    task: str,
+    subtask_index: int,
+    current_state: np.ndarray | None = None,
+    current_future: torch.Tensor | None = None,
+    current_action: torch.Tensor | None = None,
+    pending_effect: torch.Tensor | np.ndarray | None = None,
+    base_future_for_score: torch.Tensor | None = None,
+    target_transition: np.ndarray | None = None,
+    env=None,
+    model=None,
+    obs=None,
+    lang_text: str | None = None,
+    slow_target_future: torch.Tensor | None = None,
+    recent_actions=None,
+):
+    """
+    Unified coupled correction interface.
+
+    - slow: one-shot larger correction on h=(z_f, z_a) before rollout / retry.
+    - fast: small online correction during rollout using recent action history.
+    """
+    if mode == "slow":
+        future_t, action_t, info = apply_joint_repair_advantage_gate(
+            cfg,
+            task=task,
+            subtask_index=int(subtask_index or 0),
+            current_state=current_state,
+            current_future=current_future,
+            current_action=current_action,
+            pending_effect=pending_effect,
+            base_future_for_score=base_future_for_score,
+            target_transition=target_transition,
+        )
+        return future_t, action_t, {
+            "coupled_correction_used": True,
+            "coupled_correction_mode": "slow",
+            "coupled_correction_history_len": 0,
+            **info,
+        }
+    if mode == "fast":
+        future_t, action_t, info = apply_dynamic_coupling_future(
+            cfg,
+            env,
+            model,
+            obs,
+            str(lang_text or ""),
+            task,
+            int(subtask_index or 0),
+            slow_target_future,
+            recent_actions or [],
+        )
+        return future_t, action_t, {
+            "coupled_correction_used": True,
+            "coupled_correction_mode": "fast",
+            "coupled_correction_history_len": int(len(recent_actions or [])),
+            **info,
+        }
+    return current_future, current_action, {
+        "coupled_correction_used": False,
+        "coupled_correction_mode": str(mode),
+        "coupled_correction_reason": "unknown_mode",
+    }
+
+
+def maybe_apply_initial_slow_correction(
+    cfg,
+    *,
+    task: str,
+    subtask_index: int,
+    current_state: np.ndarray | None,
+    base_future: torch.Tensor | None,
+    initial_future: torch.Tensor | None,
+    initial_action: torch.Tensor | None,
+    target_transition: np.ndarray | None = None,
+):
+    """
+    Run the one-shot slow coupled correction on the initial joint hypothesis
+    h0=(z_f^0, z_a^0) before rollout starts.
+    """
+    if initial_future is None or initial_action is None:
+        return initial_future, initial_action, {
+            "coupled_correction_used": False,
+            "coupled_correction_mode": "slow",
+            "coupled_correction_reason": "missing_initial_hypothesis",
+        }
+    if not bool(getattr(cfg, "joint_pair_repair_ckpt", "") or ""):
+        return initial_future, initial_action, {
+            "coupled_correction_used": False,
+            "coupled_correction_mode": "slow",
+            "coupled_correction_reason": "missing_slow_repair_ckpt",
+        }
+    return apply_coupled_correction(
+        cfg,
+        mode="slow",
+        task=task,
+        subtask_index=int(subtask_index or 0),
+        current_state=current_state,
+        current_future=initial_future,
+        current_action=initial_action,
+        pending_effect=None,
+        base_future_for_score=base_future,
+        target_transition=target_transition,
+    )
 
 
 class RelationFutureProbeMLP(nn.Module):
@@ -2706,6 +2892,10 @@ def generate_initial_joint_action_intent(
         info = {"joint_hypothesis_init_used": False, "joint_hypothesis_init_reason": "generator_returned_none"}
         info.update(action_info)
         return None, info
+    if not _tensor_is_finite(generated_action):
+        info = {"joint_hypothesis_init_used": False, "joint_hypothesis_init_reason": "generator_non_finite"}
+        info.update(action_info)
+        return None, info
     info = {
         "joint_hypothesis_init_used": True,
         "joint_hypothesis_init_reason": "generated",
@@ -2714,6 +2904,42 @@ def generate_initial_joint_action_intent(
     }
     info.update(action_info)
     return generated_action.to(device=model.device, dtype=target_future.dtype), info
+
+
+def compute_shadow_joint_hypothesis(
+    cfg,
+    env,
+    model,
+    obs,
+    lang_text: str,
+    task: str,
+    subtask_index: int,
+):
+    """Compute h=(z_f,z_a) for logging without writing policy overrides."""
+    info = {"joint_belief_shadow_used": False}
+    try:
+        from policy_evaluation.oracle_hypothesis_rollout import defi_future_feature
+
+        future = defi_future_feature(model, obs, lang_text).detach().to(model.device)
+        future = _finite_tensor_or_none(future, name="joint_belief_shadow_future", info=info)
+        if future is None:
+            return None, None, info
+        action_intent, action_info = generate_initial_joint_action_intent(
+            cfg,
+            env,
+            model,
+            obs,
+            lang_text,
+            task,
+            int(subtask_index or 0),
+            future,
+        )
+        info.update(action_info)
+        info["joint_belief_shadow_used"] = True
+        return future, action_intent, info
+    except Exception as exc:
+        info["joint_belief_shadow_error"] = str(exc)
+        return None, None, info
 
 
 def joint_pair_memory_free_mode(cfg) -> bool:
@@ -2745,6 +2971,230 @@ def load_joint_action_generator(cfg, device: torch.device):
     return bundle
 
 
+def load_delta_action_repair(cfg, device: torch.device):
+    path = str(getattr(cfg, "dynamic_coupling_delta_action_repair_ckpt", "") or "")
+    if not path:
+        return None
+    cache_key = (path, str(device))
+    if cache_key in _DELTA_ACTION_REPAIR_CACHE:
+        return _DELTA_ACTION_REPAIR_CACHE[cache_key]
+    ckpt = torch.load(path, map_location="cpu")
+    model = DeltaActionRepairMLP(
+        state_dim=int(ckpt["state_dim"]),
+        future_dim=int(ckpt["future_dim"]),
+        action_dim=int(ckpt["action_dim"]),
+        chunk_len=int(ckpt["chunk_len"]),
+        task_dim=int(ckpt["task_dim"]),
+        hidden_dim=int(ckpt["hidden_dim"]),
+        dropout=float(ckpt.get("dropout", 0.1)),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    bundle = {
+        "model": model,
+        "state_dim": int(ckpt["state_dim"]),
+        "future_dim": int(ckpt["future_dim"]),
+        "chunk_len": int(ckpt["chunk_len"]),
+        "action_dim": int(ckpt["action_dim"]),
+        "task_dim": int(ckpt["task_dim"]),
+        "path": path,
+    }
+    _DELTA_ACTION_REPAIR_CACHE[cache_key] = bundle
+    print(f"[INFO] Loaded delta action repair model: {path}", flush=True)
+    return bundle
+
+
+def load_joint_execution_update(cfg, device: torch.device):
+    path = str(getattr(cfg, "joint_belief_transition_ckpt", "") or getattr(cfg, "joint_execution_update_ckpt", "") or "")
+    if not path:
+        return None
+    cache_key = (path, str(device))
+    if cache_key in _JOINT_EXECUTION_UPDATE_CACHE:
+        return _JOINT_EXECUTION_UPDATE_CACHE[cache_key]
+    ckpt = torch.load(path, map_location="cpu")
+    if str(ckpt.get("runtime_type", "")) == "factored_belief_action_transition":
+        t_model = BeliefTransitionMLP(
+            state_dim=int(ckpt["state_dim"]),
+            summary_dim=int(ckpt["summary_dim"]),
+            action_dim=int(ckpt["action_dim"]),
+            task_dim=int(ckpt["task_dim"]),
+            hidden_dim=int(ckpt["hidden_dim"]),
+            dropout=float(ckpt.get("dropout", 0.1)),
+        ).to(device)
+        d_model = ActionAdaptationMLP(
+            summary_dim=int(ckpt["summary_dim"]),
+            action_dim=int(ckpt["action_dim"]),
+            chunk_len=int(ckpt["chunk_len"]),
+            task_dim=int(ckpt["task_dim"]),
+            hidden_dim=int(ckpt["hidden_dim"]),
+            dropout=float(ckpt.get("dropout", 0.1)),
+        ).to(device)
+        t_model.load_state_dict(ckpt["t_model_state"])
+        d_model.load_state_dict(ckpt["d_model_state"])
+        t_model.eval()
+        d_model.eval()
+        bundle = {
+            "runtime_type": "factored_belief_action_transition",
+            "t_model": t_model,
+            "d_model": d_model,
+            "state_dim": int(ckpt["state_dim"]),
+            "summary_dim": int(ckpt["summary_dim"]),
+            "action_dim": int(ckpt["action_dim"]),
+            "chunk_len": int(ckpt["chunk_len"]),
+            "task_dim": int(ckpt["task_dim"]),
+            "has_learned_gate": True,
+            "path": path,
+        }
+        _JOINT_EXECUTION_UPDATE_CACHE[cache_key] = bundle
+        print(f"[INFO] Loaded factored belief/action transition model: {path}", flush=True)
+        return bundle
+    model = JointExecutionUpdateMLP(
+        state_dim=int(ckpt["state_dim"]),
+        summary_dim=int(ckpt["summary_dim"]),
+        action_dim=int(ckpt["action_dim"]),
+        chunk_len=int(ckpt["chunk_len"]),
+        task_dim=int(ckpt["task_dim"]),
+        hidden_dim=int(ckpt["hidden_dim"]),
+        dropout=float(ckpt.get("dropout", 0.1)),
+    ).to(device)
+    missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+    model.eval()
+    bundle = {
+        "model": model,
+        "state_dim": int(ckpt["state_dim"]),
+        "summary_dim": int(ckpt["summary_dim"]),
+        "action_dim": int(ckpt["action_dim"]),
+        "chunk_len": int(ckpt["chunk_len"]),
+        "task_dim": int(ckpt["task_dim"]),
+        "has_learned_gate": bool(ckpt.get("has_learned_gate", not any(str(k).startswith("gate_head.") for k in missing))),
+        "path": path,
+    }
+    _JOINT_EXECUTION_UPDATE_CACHE[cache_key] = bundle
+    print(f"[INFO] Loaded joint belief transition model: {path}", flush=True)
+    if missing or unexpected:
+        print(f"[INFO] Joint belief transition load missing={missing} unexpected={unexpected}", flush=True)
+    return bundle
+
+
+def load_suffix_trigger_runtime(cfg, device: torch.device):
+    path = str(getattr(cfg, "suffix_trigger_mlp_ckpt", "") or "")
+    if not path:
+        return None
+    cache_key = (path, str(device))
+    if cache_key in _SUFFIX_TRIGGER_CACHE:
+        return _SUFFIX_TRIGGER_CACHE[cache_key]
+    ckpt = torch.load(path, map_location="cpu")
+    model = SuffixTriggerMLP(
+        feature_dim=int(ckpt["feature_dim"]),
+        hidden_dim=int(ckpt["hidden_dim"]),
+        dropout=float(ckpt.get("dropout", 0.05)),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    bundle = {
+        "model": model,
+        "feature_dim": int(ckpt["feature_dim"]),
+        "task_dim": int(ckpt.get("task_dim", 32)),
+        "path": path,
+    }
+    _SUFFIX_TRIGGER_CACHE[cache_key] = bundle
+    print(f"[INFO] Loaded suffix trigger model: {path}", flush=True)
+    return bundle
+
+
+def predict_suffix_trigger_runtime(
+    bundle,
+    *,
+    task: str,
+    subtask_index: int,
+    chunk_decision: dict,
+    coupling_info: dict,
+) -> dict:
+    if bundle is None:
+        return {"used": False}
+    try:
+        feature = build_suffix_trigger_feature(
+            task=task,
+            subtask_index=int(subtask_index or 0),
+            residual_norm=float(chunk_decision.get("residual_norm", 0.0) or 0.0),
+            compat=float(chunk_decision.get("compat", 0.0) or 0.0),
+            success_prob=float(chunk_decision.get("success_prob", 0.0) or 0.0),
+            current_to_target_norm=float(coupling_info.get("dynamic_coupling_current_to_target_norm", 0.0) or 0.0),
+            shift_norm_vs_slow=float(coupling_info.get("dynamic_coupling_shift_norm_vs_slow", 0.0) or 0.0),
+            committed_scalar=float(coupling_info.get("dynamic_coupling_committed_scalar", 0.0) or 0.0),
+            learned_gate=float(chunk_decision.get("joint_execution_learned_gate_raw", 0.0) or 0.0),
+            joint_gate=float(chunk_decision.get("joint_execution_gate", 0.0) or 0.0),
+            joint_error=float(chunk_decision.get("joint_execution_error", 0.0) or 0.0),
+            task_dim=int(bundle["task_dim"]),
+        )
+        x = torch.from_numpy(feature).to(next(bundle["model"].parameters()).device).unsqueeze(0)
+        with torch.no_grad():
+            prob = float(torch.sigmoid(bundle["model"](x))[0].item())
+        return {"used": True, "prob": prob}
+    except Exception as exc:
+        return {"used": True, "error": str(exc)}
+
+
+def load_future_action_dynamics_runtime(cfg, device: torch.device):
+    path = str(getattr(cfg, "dynamic_coupling_chunk_effect_ckpt", "") or "")
+    if not path:
+        return None
+    cache_key = (path, str(device))
+    if cache_key in _FUTURE_ACTION_DYNAMICS_CACHE:
+        return _FUTURE_ACTION_DYNAMICS_CACHE[cache_key]
+    ckpt = torch.load(path, map_location="cpu")
+    if "summary_dim" in ckpt and "future_dim" not in ckpt:
+        model = ChunkEffectPhiMLP(
+            state_dim=int(ckpt["state_dim"]),
+            summary_dim=int(ckpt["summary_dim"]),
+            action_dim=int(ckpt["action_dim"]),
+            chunk_len=int(ckpt["chunk_len"]),
+            task_dim=int(ckpt["task_dim"]),
+            hidden_dim=int(ckpt["hidden_dim"]),
+            dropout=float(ckpt.get("dropout", 0.1)),
+        ).to(device)
+        model.load_state_dict(ckpt["model_state"])
+        model.eval()
+        bundle = {
+            "model": model,
+            "runtime_type": "chunk_effect_phi_mlp",
+            "task_dim": int(ckpt["task_dim"]),
+            "summary_dim": int(ckpt["summary_dim"]),
+            "state_dim": int(ckpt["state_dim"]),
+            "chunk_len": int(ckpt["chunk_len"]),
+            "action_dim": int(ckpt["action_dim"]),
+            "path": path,
+        }
+        _FUTURE_ACTION_DYNAMICS_CACHE[cache_key] = bundle
+        print(f"[INFO] Loaded chunk-effect phi model: {path}", flush=True)
+        return bundle
+    model = FutureActionDynamicsProbe(
+        action_dim=int(ckpt["action_dim"]),
+        future_dim=int(ckpt["future_dim"]),
+        task_dim=int(ckpt["task_dim"]),
+        hidden_dim=int(ckpt["hidden_dim"]),
+        z_dim=int(ckpt["z_dim"]),
+        dropout=float(ckpt.get("dropout", 0.1)),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    delta_mean = torch.from_numpy(np.asarray(ckpt["delta_mean"], dtype=np.float32)).to(device)
+    delta_std = torch.from_numpy(np.asarray(ckpt["delta_std"], dtype=np.float32)).to(device)
+    bundle = {
+        "model": model,
+        "runtime_type": "future_action_dynamics_probe",
+        "task_dim": int(ckpt["task_dim"]),
+        "future_dim": int(ckpt["future_dim"]),
+        "action_dim": int(ckpt["action_dim"]),
+        "delta_mean": delta_mean,
+        "delta_std": delta_std,
+        "path": path,
+    }
+    _FUTURE_ACTION_DYNAMICS_CACHE[cache_key] = bundle
+    print(f"[INFO] Loaded future action dynamics probe: {path}", flush=True)
+    return bundle
+
+
 def load_summary_future_adapter(cfg, device: torch.device):
     path = str(getattr(cfg, "joint_pair_summary_future_adapter_ckpt", "") or "")
     if not path:
@@ -2769,6 +3219,520 @@ def load_summary_future_adapter(cfg, device: torch.device):
     _SUMMARY_FUTURE_ADAPTER_CACHE[cache_key] = bundle
     print(f"[INFO] Loaded standalone summary future adapter: {path}", flush=True)
     return bundle
+
+
+def _pool_exec_summary_np(summary: np.ndarray, out_dim: int) -> np.ndarray:
+    summary = np.asarray(summary, dtype=np.float32).reshape(-1)
+    if summary.size == int(out_dim):
+        return summary.astype(np.float32)
+    if summary.size < int(out_dim):
+        out = np.zeros((int(out_dim),), dtype=np.float32)
+        out[: summary.size] = summary
+        return out
+    trim = (summary.size // int(out_dim)) * int(out_dim)
+    return summary[:trim].reshape(int(out_dim), trim // int(out_dim)).mean(axis=1).astype(np.float32)
+
+
+def _coerce_runtime_vector_np(values: np.ndarray, out_dim: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    out_dim = int(out_dim)
+    if values.size == out_dim:
+        return values.astype(np.float32)
+    if values.size < out_dim:
+        out = np.zeros((out_dim,), dtype=np.float32)
+        out[: values.size] = values
+        return out
+    return values[:out_dim].astype(np.float32)
+
+
+def _coerce_runtime_action_chunk(action_chunk: torch.Tensor, chunk_len: int, action_dim: int, device: torch.device) -> torch.Tensor:
+    action_t = action_chunk.detach().to(device=device, dtype=torch.float32)
+    if action_t.dim() == 2:
+        action_t = action_t.unsqueeze(0)
+    if action_t.shape[-1] != int(action_dim):
+        raise ValueError(f"delta action repair expected action_dim={action_dim}, got {action_t.shape[-1]}")
+    if action_t.shape[1] == int(chunk_len):
+        return action_t
+    fixed = torch.zeros((action_t.shape[0], int(chunk_len), int(action_dim)), device=device, dtype=torch.float32)
+    n = min(int(chunk_len), int(action_t.shape[1]))
+    fixed[:, :n] = action_t[:, :n]
+    return fixed
+
+
+def _tensor_is_finite(value) -> bool:
+    return torch.is_tensor(value) and (not value.is_floating_point() or bool(torch.isfinite(value).all().item()))
+
+
+def _finite_tensor_or_none(value, *, name: str, info: dict | None = None):
+    if value is None:
+        return None
+    if not torch.is_tensor(value):
+        if info is not None:
+            info[f"{name}_finite"] = False
+            info[f"{name}_reject_reason"] = "not_tensor"
+        return None
+    if _tensor_is_finite(value):
+        if info is not None:
+            info[f"{name}_finite"] = True
+        return value
+    if info is not None:
+        detached = value.detach()
+        finite_values = detached[torch.isfinite(detached)] if detached.is_floating_point() else detached.reshape(-1)
+        info[f"{name}_finite"] = False
+        info[f"{name}_reject_reason"] = "non_finite"
+        info[f"{name}_finite_count"] = int(finite_values.numel())
+    return None
+
+
+def _chunk_effect_runtime_meta(subtask_index: int, action_len: int, full_len: int) -> np.ndarray:
+    full_len = max(int(full_len), 1)
+    action_len = max(int(action_len), 1)
+    cut_idx = max(0, full_len - action_len)
+    return np.asarray(
+        [
+            float(subtask_index or 0) / 5.0,
+            float(cut_idx) / float(max(full_len - 1, 1)),
+            float(action_len) / float(full_len),
+        ],
+        dtype=np.float32,
+    ).reshape(1, -1)
+
+
+def predict_joint_execution_update(
+    cfg,
+    model,
+    *,
+    task: str,
+    subtask_index: int,
+    state_start: np.ndarray | None,
+    state_end: np.ndarray | None,
+    base_summary_exec: np.ndarray,
+    target_summary_exec: np.ndarray,
+    remaining_action_chunk: torch.Tensor | None,
+    executed_action: np.ndarray | None = None,
+):
+    bundle = load_joint_execution_update(cfg, model.device)
+    if bundle is None:
+        return None, {"joint_execution_update_used": False, "joint_execution_update_reason": "missing_ckpt"}
+    if state_start is None or state_end is None or remaining_action_chunk is None:
+        return None, {"joint_execution_update_used": False, "joint_execution_update_reason": "missing_state_or_action"}
+    try:
+        state_dim = int(bundle["state_dim"])
+        summary_dim = int(bundle["summary_dim"])
+        action_dim = int(bundle["action_dim"])
+        chunk_len = int(bundle["chunk_len"])
+        action_t = _coerce_runtime_action_chunk(remaining_action_chunk, chunk_len, action_dim, model.device)
+        state_start_np = _coerce_runtime_vector_np(state_start, state_dim).reshape(1, -1)
+        state_end_np = _coerce_runtime_vector_np(state_end, state_dim).reshape(1, -1)
+        base_np = _pool_exec_summary_np(base_summary_exec, summary_dim).reshape(1, -1)
+        target_np = _pool_exec_summary_np(target_summary_exec, summary_dim).reshape(1, -1)
+        task_vec = np.asarray(q_hashed_task(task, int(bundle["task_dim"])), dtype=np.float32).reshape(1, -1)
+        meta = _chunk_effect_runtime_meta(int(subtask_index or 0), int(action_t.shape[1]), chunk_len)
+        if str(bundle.get("runtime_type", "")) == "factored_belief_action_transition":
+            exec_action_np = _coerce_runtime_vector_np(
+                np.zeros((action_dim,), dtype=np.float32) if executed_action is None else executed_action,
+                action_dim,
+            ).reshape(1, -1)
+            with torch.no_grad():
+                state_start_t = torch.from_numpy(state_start_np).to(model.device)
+                state_end_t = torch.from_numpy(state_end_np).to(model.device)
+                base_t = torch.from_numpy(base_np).to(model.device)
+                task_t = torch.from_numpy(task_vec).to(model.device)
+                meta_t = torch.from_numpy(meta).to(model.device)
+                pred_delta_h = bundle["t_model"](
+                    base_t,
+                    state_start_t,
+                    torch.from_numpy(exec_action_np).to(model.device),
+                    state_end_t,
+                    task_t,
+                    meta_t,
+                )
+                pred_next_h = base_t + pred_delta_h
+                d_out = bundle["d_model"](action_t, base_t, pred_next_h, task_t, meta_t)
+            action_delta = d_out["action_delta"].detach()
+            mode_logits = d_out["mode_logits"].detach()
+            mode_prob = torch.softmax(mode_logits, dim=-1)
+            mode_idx = int(mode_prob.argmax(dim=-1).reshape(-1)[0].item())
+            mode_name = ["keep", "patch", "replan"][max(0, min(2, mode_idx))]
+            confidence = float(torch.sigmoid(d_out["confidence_logit"]).reshape(-1)[0].item())
+            error = float(torch.norm(pred_delta_h.reshape(-1), p=2).item())
+            learned_gate = float(mode_prob[:, 1].reshape(-1)[0].item())
+            success_prob = confidence
+            max_delta_norm = float(torch.norm(action_delta.reshape(-1), p=2).item())
+            return {
+                "future_delta": pred_delta_h.detach(),
+                "action_delta": action_delta,
+                "error": error,
+                "learned_gate": learned_gate,
+                "success_prob": success_prob,
+                "mode": mode_name,
+                "mode_prob": mode_prob.detach(),
+                "confidence": confidence,
+                "action_delta_norm": max_delta_norm,
+            }, {
+                "joint_execution_update_used": True,
+                "joint_execution_update_runtime_type": "factored_belief_action_transition",
+                "joint_execution_error": error,
+                "joint_execution_learned_gate": learned_gate,
+                "joint_execution_has_learned_gate": True,
+                "joint_execution_success_prob": success_prob,
+                "joint_execution_mode": mode_name,
+                "joint_execution_mode_keep_prob": float(mode_prob[:, 0].reshape(-1)[0].item()),
+                "joint_execution_mode_patch_prob": float(mode_prob[:, 1].reshape(-1)[0].item()),
+                "joint_execution_mode_replan_prob": float(mode_prob[:, 2].reshape(-1)[0].item()),
+                "joint_execution_confidence": confidence,
+                "joint_execution_future_delta_norm": float(torch.norm(pred_delta_h.reshape(-1), p=2).item()),
+                "joint_execution_action_delta_norm": max_delta_norm,
+                "joint_execution_runtime_state_dim": state_dim,
+                "joint_execution_runtime_summary_dim": summary_dim,
+                "joint_execution_runtime_chunk_len": chunk_len,
+            }
+        with torch.no_grad():
+            out = bundle["model"](
+                torch.from_numpy(state_start_np).to(model.device),
+                torch.from_numpy(state_end_np).to(model.device),
+                torch.from_numpy(base_np).to(model.device),
+                torch.from_numpy(target_np).to(model.device),
+                action_t,
+                torch.from_numpy(task_vec).to(model.device),
+                torch.from_numpy(meta).to(model.device),
+            )
+        error = float(out["error"].reshape(-1)[0].item())
+        learned_gate = float(torch.sigmoid(out["gate_logit"]).reshape(-1)[0].item()) if "gate_logit" in out else float("nan")
+        success_prob = float(torch.sigmoid(out["success_logit"]).reshape(-1)[0].item())
+        future_delta = out["future_delta"].detach()
+        action_delta = out["action_delta"].detach()
+        return {
+            "future_delta": future_delta,
+            "action_delta": action_delta,
+            "error": error,
+            "learned_gate": learned_gate,
+            "success_prob": success_prob,
+        }, {
+            "joint_execution_update_used": True,
+            "joint_execution_update_runtime_type": "joint_execution_update_mlp",
+            "joint_execution_error": error,
+            "joint_execution_learned_gate": learned_gate,
+            "joint_execution_has_learned_gate": bool(bundle.get("has_learned_gate", False)),
+            "joint_execution_success_prob": success_prob,
+            "joint_execution_future_delta_norm": float(torch.norm(future_delta.reshape(-1), p=2).item()),
+            "joint_execution_action_delta_norm": float(torch.norm(action_delta.reshape(-1), p=2).item()),
+            "joint_execution_runtime_state_dim": state_dim,
+            "joint_execution_runtime_summary_dim": summary_dim,
+            "joint_execution_runtime_chunk_len": chunk_len,
+        }
+    except Exception as exc:
+        return None, {"joint_execution_update_used": True, "joint_execution_update_reason": f"error:{exc}"}
+
+
+def predict_delta_action_repair(
+    cfg,
+    model,
+    *,
+    task: str,
+    subtask_index: int,
+    current_state: np.ndarray | None,
+    current_action_chunk: torch.Tensor | None,
+    base_summary_exec: np.ndarray,
+    target_summary_exec: np.ndarray,
+):
+    if current_state is None or current_action_chunk is None:
+        return None, {"delta_action_repair_used": False, "delta_action_repair_reason": "missing_state_or_action"}
+    bundle = load_delta_action_repair(cfg, model.device)
+    if bundle is None:
+        return None, {"delta_action_repair_used": False, "delta_action_repair_reason": "missing_ckpt"}
+    try:
+        state_dim = int(bundle["state_dim"])
+        future_dim = int(bundle["future_dim"])
+        action_dim = int(bundle["action_dim"])
+        chunk_len = int(bundle["chunk_len"])
+        action_t = _coerce_runtime_action_chunk(current_action_chunk, chunk_len, action_dim, model.device)
+        task_vec = np.asarray(q_hashed_task(task, int(bundle["task_dim"])), dtype=np.float32)
+        sub = np.asarray([[float(subtask_index or 0) / 5.0]], dtype=np.float32)
+        state_start = _coerce_runtime_vector_np(current_state, state_dim).reshape(1, -1)
+        base_summary_exec = _pool_exec_summary_np(base_summary_exec, future_dim).reshape(1, -1)
+        target_summary_exec = _pool_exec_summary_np(target_summary_exec, future_dim).reshape(1, -1)
+        target_delta_exec = (target_summary_exec - base_summary_exec).astype(np.float32)
+        with torch.no_grad():
+            delta = bundle["model"](
+                torch.from_numpy(state_start).to(model.device),
+                torch.from_numpy(base_summary_exec).to(model.device),
+                torch.from_numpy(target_summary_exec).to(model.device),
+                torch.from_numpy(target_delta_exec).to(model.device),
+                action_t,
+                torch.from_numpy(task_vec.reshape(1, -1)).to(model.device),
+                torch.from_numpy(sub).to(model.device),
+            )
+        info = {
+            "delta_action_repair_used": True,
+            "delta_action_repair_applied": True,
+            "delta_action_repair_delta_norm": float(torch.norm(delta.reshape(-1), p=2).item()),
+            "delta_action_repair_input_action_norm": float(torch.norm(action_t.reshape(-1), p=2).item()),
+            "delta_action_repair_runtime_state_dim": state_dim,
+            "delta_action_repair_runtime_future_dim": future_dim,
+            "delta_action_repair_runtime_chunk_len": chunk_len,
+        }
+        return delta.detach(), info
+    except Exception as exc:
+        return None, {"delta_action_repair_used": True, "delta_action_repair_applied": False, "delta_action_repair_reason": f"error:{exc}"}
+
+
+def predict_remaining_chunk_effect(
+    cfg,
+    model,
+    *,
+    task: str,
+    subtask_index: int,
+    current_state: np.ndarray | None,
+    base_summary_exec: np.ndarray,
+    target_summary_exec: np.ndarray,
+    remaining_action_chunk: torch.Tensor | None,
+):
+    if remaining_action_chunk is None:
+        return None, {
+            "chunk_effect_used": False,
+            "chunk_effect_reason": "missing_action_chunk",
+        }
+    bundle = load_future_action_dynamics_runtime(cfg, model.device)
+    if bundle is None:
+        return None, {
+            "chunk_effect_used": False,
+            "chunk_effect_reason": "missing_ckpt",
+        }
+    try:
+        action_t = remaining_action_chunk.detach().to(device=model.device, dtype=torch.float32)
+        if action_t.dim() == 2:
+            action_t = action_t.unsqueeze(0)
+        if str(bundle.get("runtime_type", "")) == "chunk_effect_phi_mlp":
+            if current_state is None:
+                return None, {
+                    "chunk_effect_used": True,
+                    "chunk_effect_reason": "missing_state_for_phi_mlp",
+                }
+            full_len = int(bundle["chunk_len"])
+            if action_t.shape[1] < full_len:
+                padded = torch.zeros((action_t.shape[0], full_len, action_t.shape[-1]), dtype=action_t.dtype, device=action_t.device)
+                padded[:, : action_t.shape[1]] = action_t
+                action_t = padded
+            elif action_t.shape[1] > full_len:
+                action_t = action_t[:, :full_len]
+            task_vec = np.asarray(q_hashed_task(task, int(bundle["task_dim"])), dtype=np.float32).reshape(1, -1)
+            base_summary_exec = _pool_exec_summary_np(base_summary_exec, int(bundle["summary_dim"])).reshape(1, -1)
+            target_summary_exec = _pool_exec_summary_np(target_summary_exec, int(bundle["summary_dim"])).reshape(1, -1)
+            target_delta_exec = (target_summary_exec - base_summary_exec).astype(np.float32)
+            meta = _chunk_effect_runtime_meta(
+                subtask_index=int(subtask_index or 0),
+                action_len=int(min(remaining_action_chunk.shape[-2], full_len)),
+                full_len=full_len,
+            )
+            with torch.no_grad():
+                out = bundle["model"](
+                    torch.from_numpy(np.asarray(current_state, dtype=np.float32).reshape(1, -1)).to(model.device),
+                    torch.from_numpy(base_summary_exec).to(model.device),
+                    action_t,
+                    torch.from_numpy(task_vec).to(model.device),
+                    torch.from_numpy(meta).to(model.device),
+                )
+            pred_delta = out["delta"].detach()
+            target_delta_t = torch.from_numpy(target_delta_exec).to(model.device)
+            residual = target_delta_t - pred_delta
+            compat = F.cosine_similarity(pred_delta, target_delta_t, dim=-1).mean()
+            success_prob = torch.sigmoid(out["success_logit"]).mean()
+            info = {
+                "chunk_effect_used": True,
+                "chunk_effect_runtime_type": "chunk_effect_phi_mlp",
+                "chunk_effect_pred_norm": float(torch.norm(pred_delta.reshape(-1), p=2).item()),
+                "chunk_effect_target_norm": float(torch.norm(target_delta_t.reshape(-1), p=2).item()),
+                "chunk_effect_residual_norm": float(torch.norm(residual.reshape(-1), p=2).item()),
+                "chunk_effect_transition_cos": float(compat.item()),
+                "chunk_effect_success_prob": float(success_prob.item()),
+                "chunk_effect_remaining_steps": int(action_t.shape[1]),
+            }
+            return {
+                "pred_delta": pred_delta,
+                "target_delta": target_delta_t,
+                "residual": residual,
+                "compat": compat,
+                "success_prob": success_prob,
+            }, info
+        task_vec = np.asarray(q_hashed_task(task, int(bundle["task_dim"])), dtype=np.float32).reshape(1, -1)
+        sub = np.asarray([[float(subtask_index or 0) / 5.0]], dtype=np.float32)
+        base_summary_exec = np.asarray(base_summary_exec, dtype=np.float32).reshape(1, -1)
+        target_summary_exec = np.asarray(target_summary_exec, dtype=np.float32).reshape(1, -1)
+        target_delta_exec = (target_summary_exec - base_summary_exec).astype(np.float32)
+        with torch.no_grad():
+            out = bundle["model"](
+                torch.from_numpy(base_summary_exec).to(model.device),
+                action_t,
+                torch.from_numpy(task_vec).to(model.device),
+                torch.from_numpy(sub).to(model.device),
+                torch.from_numpy(target_delta_exec).to(model.device),
+            )
+        pred_delta = out["pred_delta"].detach()
+        target_delta_t = torch.from_numpy(target_delta_exec).to(model.device)
+        residual = target_delta_t - pred_delta
+        pred_delta_norm = (pred_delta - bundle["delta_mean"].unsqueeze(0)) / bundle["delta_std"].unsqueeze(0)
+        target_delta_norm = (target_delta_t - bundle["delta_mean"].unsqueeze(0)) / bundle["delta_std"].unsqueeze(0)
+        compat = F.cosine_similarity(pred_delta_norm, target_delta_norm, dim=-1).mean()
+        success_prob = torch.sigmoid(out["success_logit"]).mean()
+        info = {
+            "chunk_effect_used": True,
+            "chunk_effect_pred_norm": float(torch.norm(pred_delta.reshape(-1), p=2).item()),
+            "chunk_effect_target_norm": float(torch.norm(target_delta_t.reshape(-1), p=2).item()),
+            "chunk_effect_residual_norm": float(torch.norm(residual.reshape(-1), p=2).item()),
+            "chunk_effect_transition_cos": float(compat.item()),
+            "chunk_effect_success_prob": float(success_prob.item()),
+            "chunk_effect_remaining_steps": int(action_t.shape[1]),
+        }
+        return {
+            "pred_delta": pred_delta,
+            "target_delta": target_delta_t,
+            "residual": residual,
+            "compat": compat,
+            "success_prob": success_prob,
+        }, info
+    except Exception as exc:
+        return None, {
+            "chunk_effect_used": True,
+            "chunk_effect_reason": f"error:{exc}",
+        }
+
+
+def decide_chunk_intervention(cfg, effect_payload, delta_action_t):
+    keep_threshold = float(getattr(cfg, "dynamic_coupling_chunk_keep_threshold", 0.35))
+    replan_threshold = float(getattr(cfg, "dynamic_coupling_chunk_replan_threshold", 0.75))
+    success_threshold = float(getattr(cfg, "dynamic_coupling_chunk_success_threshold", 0.5))
+    low_compat_threshold = float(getattr(cfg, "dynamic_coupling_chunk_low_compat_threshold", 0.0))
+    disable_replan = bool(getattr(cfg, "dynamic_coupling_disable_replan", False))
+    suffix_success_below = float(getattr(cfg, "dynamic_coupling_suffix_trigger_success_below", 1.0))
+    suffix_residual_above = float(getattr(cfg, "dynamic_coupling_suffix_trigger_residual_above", 0.0))
+    suffix_compat_below = float(getattr(cfg, "dynamic_coupling_suffix_trigger_compat_below", 1.0))
+    if effect_payload is None:
+        return {
+            "decision": "fallback",
+            "decision_reason": "missing_effect_payload",
+            "residual_norm": float("nan"),
+            "compat": float("nan"),
+            "success_prob": float("nan"),
+            "keep_threshold": keep_threshold,
+            "replan_threshold": replan_threshold,
+            "success_threshold": success_threshold,
+            "low_compat_threshold": low_compat_threshold,
+        }
+    residual_norm = float(torch.norm(effect_payload["residual"].reshape(-1), p=2).item())
+    compat = float(effect_payload["compat"].item())
+    success_prob = float(effect_payload["success_prob"].item())
+    suffix_triggered = (
+        delta_action_t is not None
+        and (
+            success_prob <= suffix_success_below
+            or residual_norm >= suffix_residual_above
+            or compat <= suffix_compat_below
+        )
+    )
+    if residual_norm <= keep_threshold and compat >= low_compat_threshold and success_prob >= success_threshold:
+        decision = "keep"
+        reason = "residual_small_and_chunk_still_compatible"
+    elif residual_norm >= replan_threshold or compat < low_compat_threshold:
+        if disable_replan and suffix_triggered:
+            decision = "repair_suffix"
+            reason = "suffix_trigger_patch_large_residual_or_low_score"
+        elif disable_replan:
+            decision = "keep"
+            reason = "suffix_trigger_rejected_keep_no_replan"
+        else:
+            decision = "replan"
+            reason = "residual_large_or_direction_incompatible"
+    elif suffix_triggered:
+        decision = "repair_suffix"
+        reason = "suffix_trigger_patch_mid_residual_or_low_score"
+    elif disable_replan:
+        decision = "keep"
+        reason = "suffix_trigger_rejected_keep_no_replan"
+    else:
+        decision = "replan"
+        reason = "mid_residual_but_no_suffix_repair_model"
+    return {
+        "decision": decision,
+        "decision_reason": reason,
+        "residual_norm": residual_norm,
+        "compat": compat,
+        "success_prob": success_prob,
+        "keep_threshold": keep_threshold,
+        "replan_threshold": replan_threshold,
+        "success_threshold": success_threshold,
+        "low_compat_threshold": low_compat_threshold,
+        "disable_replan": disable_replan,
+        "suffix_triggered": bool(suffix_triggered),
+        "suffix_success_below": suffix_success_below,
+        "suffix_residual_above": suffix_residual_above,
+        "suffix_compat_below": suffix_compat_below,
+    }
+
+
+def joint_execution_update_gain(cfg, effect_payload):
+    """Compute a scalar execution mismatch e_t and update gate g(e_t)."""
+    if effect_payload is None:
+        return {
+            "joint_execution_update_used": True,
+            "joint_execution_error": 0.0,
+            "joint_execution_gate": 0.0,
+            "joint_execution_reason": "missing_effect_payload",
+        }
+    residual_norm = float(torch.norm(effect_payload["residual"].reshape(-1), p=2).item())
+    compat = float(effect_payload["compat"].item())
+    success_prob = float(effect_payload["success_prob"].item())
+    residual_scale = max(float(getattr(cfg, "joint_execution_error_residual_scale", 30.0)), 1e-6)
+    success_target = float(getattr(cfg, "joint_execution_error_success_target", 0.05))
+    compat_target = float(getattr(cfg, "joint_execution_error_compat_target", -0.1))
+    success_weight = float(getattr(cfg, "joint_execution_error_success_weight", 2.0))
+    compat_weight = float(getattr(cfg, "joint_execution_error_compat_weight", 1.0))
+    error = (
+        residual_norm / residual_scale
+        + success_weight * max(0.0, success_target - success_prob)
+        + compat_weight * max(0.0, compat_target - compat)
+    )
+    threshold = float(getattr(cfg, "joint_execution_update_threshold", 1.0))
+    gain = float(getattr(cfg, "joint_execution_update_gain", 1.0))
+    min_gate = float(getattr(cfg, "joint_execution_update_min_gate", 0.0))
+    max_gate = float(getattr(cfg, "joint_execution_update_max_gate", 0.3))
+    gate = float(np.clip(max(0.0, error - threshold) * gain, min_gate, max_gate))
+    return {
+        "joint_execution_update_used": True,
+        "joint_execution_error": float(error),
+        "joint_execution_gate": float(gate),
+        "joint_execution_residual_norm": residual_norm,
+        "joint_execution_success_prob": success_prob,
+        "joint_execution_compat": compat,
+        "joint_execution_error_threshold": threshold,
+        "joint_execution_error_residual_scale": residual_scale,
+        "joint_execution_error_success_target": success_target,
+        "joint_execution_error_compat_target": compat_target,
+    }
+
+
+def decide_joint_execution_suffix(cfg, effect_payload, delta_action_t):
+    update_info = joint_execution_update_gain(cfg, effect_payload)
+    threshold = float(getattr(cfg, "joint_execution_suffix_error_threshold", 1.0))
+    if delta_action_t is not None and float(update_info["joint_execution_error"]) >= threshold:
+        decision = "repair_suffix"
+        reason = "joint_execution_error_above_suffix_threshold"
+    else:
+        decision = "keep"
+        reason = "joint_execution_error_below_suffix_threshold"
+    return {
+        "decision": decision,
+        "decision_reason": reason,
+        "residual_norm": float(update_info["joint_execution_residual_norm"]) if "joint_execution_residual_norm" in update_info else float("nan"),
+        "compat": float(update_info["joint_execution_compat"]) if "joint_execution_compat" in update_info else float("nan"),
+        "success_prob": float(update_info["joint_execution_success_prob"]) if "joint_execution_success_prob" in update_info else float("nan"),
+        "keep_threshold": float(getattr(cfg, "dynamic_coupling_chunk_keep_threshold", 0.35)),
+        "replan_threshold": float(getattr(cfg, "dynamic_coupling_chunk_replan_threshold", 0.75)),
+        "success_threshold": float(getattr(cfg, "dynamic_coupling_chunk_success_threshold", 0.5)),
+        "low_compat_threshold": float(getattr(cfg, "dynamic_coupling_chunk_low_compat_threshold", 0.0)),
+        "disable_replan": True,
+        **update_info,
+    }
 
 
 def load_joint_repair_runtime(cfg, device: torch.device):
@@ -2904,6 +3868,60 @@ def _repair_pending_to_summary_exec(pending_effect: torch.Tensor | np.ndarray | 
     return arr.reshape(-1).astype(np.float32)
 
 
+def _joint_score_gate_info(
+    cfg,
+    *,
+    task: str,
+    subtask_index: int,
+    current_state: np.ndarray | None,
+    base_future: torch.Tensor | None,
+    target_future: torch.Tensor | None,
+    target_action: torch.Tensor | None,
+    target_transition: np.ndarray | None = None,
+    prefix: str = "joint_repair_score",
+):
+    score_info = score_joint_hypothesis_candidate(
+        cfg,
+        base_future=base_future,
+        target_future=target_future,
+        action_chunk=target_action,
+        task=task,
+        subtask_index=int(subtask_index or 0),
+        current_state=current_state,
+        target_transition=target_transition,
+        prefix=prefix,
+    )
+    if not bool(score_info.get(f"{prefix}_used", False)):
+        return False, {
+            f"{prefix}_gate_used": False,
+            f"{prefix}_gate_reason": str(score_info.get(f"{prefix}_reason", "score_unavailable")),
+            **score_info,
+        }
+    c_exp = float(score_info.get(f"{prefix}_c_exp", 0.0))
+    c_latent = float(score_info.get(f"{prefix}_c_latent", 0.0))
+    c_physical = float(score_info.get(f"{prefix}_c_physical", 0.0))
+    max_exp = float(getattr(cfg, "joint_pair_verify_exp_max", 1e9))
+    max_latent = float(getattr(cfg, "joint_pair_verify_latent_max", 1e9))
+    max_physical = float(getattr(cfg, "joint_pair_verify_physical_max", 1e9))
+    reasons = []
+    if c_exp > max_exp:
+        reasons.append(f"c_exp>{max_exp:g}")
+    if c_latent > max_latent:
+        reasons.append(f"c_latent>{max_latent:g}")
+    if c_physical > max_physical:
+        reasons.append(f"c_physical>{max_physical:g}")
+    passed = len(reasons) == 0
+    return passed, {
+        f"{prefix}_gate_used": True,
+        f"{prefix}_gate_passed": bool(passed),
+        f"{prefix}_gate_reason": "pass" if passed else ";".join(reasons),
+        f"{prefix}_gate_exp_max": float(max_exp),
+        f"{prefix}_gate_latent_max": float(max_latent),
+        f"{prefix}_gate_physical_max": float(max_physical),
+        **score_info,
+    }
+
+
 def apply_joint_repair_advantage_gate(
     cfg,
     task: str,
@@ -2912,12 +3930,43 @@ def apply_joint_repair_advantage_gate(
     current_future: torch.Tensor | None,
     current_action: torch.Tensor | None,
     pending_effect: torch.Tensor | np.ndarray | None = None,
+    base_future_for_score: torch.Tensor | None = None,
+    target_transition: np.ndarray | None = None,
 ):
     if current_state is None or current_future is None or current_action is None:
         return current_future, current_action, {"joint_repair_advantage_used": False, "joint_repair_advantage_reason": "missing_inputs"}
+    score_base_future = base_future_for_score if base_future_for_score is not None else current_future
+    score_passed, score_gate_info = _joint_score_gate_info(
+        cfg,
+        task=task,
+        subtask_index=int(subtask_index or 0),
+        current_state=current_state,
+        base_future=score_base_future,
+        target_future=current_future,
+        target_action=current_action,
+        target_transition=target_transition,
+        prefix="joint_repair_score_before",
+    )
+    if bool(score_gate_info.get("joint_repair_score_before_gate_used", False)) and score_passed:
+        return current_future, current_action, {
+            "joint_repair_advantage_used": True,
+            "joint_repair_advantage_mode": "joint_score_pass",
+            "joint_repair_advantage_reason": "joint_score_pass",
+            "joint_repair_advantage_pred": 0.0,
+            "joint_repair_advantage_passed": True,
+            "joint_repair_advantage_future_delta_norm": 0.0,
+            "joint_repair_advantage_action_delta_norm": 0.0,
+            "joint_repair_advantage_pending_norm": 0.0,
+            "joint_pair_repair_used": False,
+            **score_gate_info,
+        }
     bundle = load_joint_repair_runtime(cfg, current_future.device)
     if bundle is None:
-        return current_future, current_action, {"joint_repair_advantage_used": False, "joint_repair_advantage_reason": "missing_repair_runtime"}
+        return current_future, current_action, {
+            "joint_repair_advantage_used": False,
+            "joint_repair_advantage_reason": "missing_repair_runtime",
+            **score_gate_info,
+        }
 
     repaired_future, repaired_action, repair_info = _joint_pair_apply_repair(
         bundle,
@@ -2926,16 +3975,32 @@ def apply_joint_repair_advantage_gate(
         current_state=current_state,
         target_future=current_future,
         target_action=current_action,
-        target_transition=None,
+        target_transition=target_transition,
     )
     if not bool(repair_info.get("joint_pair_repair_used", False)):
         return current_future, current_action, {
             "joint_repair_advantage_used": False,
             "joint_repair_advantage_reason": "repair_not_used",
+            **score_gate_info,
             **repair_info,
         }
 
+    state_np = np.asarray(current_state, dtype=np.float32).reshape(-1)
+    future_arr = np.asarray(current_future.detach().float().cpu().numpy(), dtype=np.float32)
+    future_np = _joint_pair_future_summary_exec(future_arr).reshape(-1) if future_arr.ndim == 2 else future_arr.reshape(-1)
+    action_np = np.asarray(current_action.detach().float().cpu().numpy(), dtype=np.float32).reshape(-1)
+    repaired_future_arr = np.asarray(repaired_future.detach().float().cpu().numpy(), dtype=np.float32)
+    repaired_future_np = _joint_pair_future_summary_exec(repaired_future_arr).reshape(-1) if repaired_future_arr.ndim == 2 else repaired_future_arr.reshape(-1)
+    repaired_action_np = np.asarray(repaired_action.detach().float().cpu().numpy(), dtype=np.float32).reshape(-1)
+    delta_future_np = (repaired_future_np - future_np).astype(np.float32)
+    delta_action_np = (repaired_action_np - action_np).astype(np.float32)
+    pending_np = _repair_pending_to_summary_exec(pending_effect)
+    if pending_np is None or pending_np.size != delta_future_np.size:
+        pending_np = delta_future_np.copy()
     value_bundle = load_joint_value_runtime(cfg, current_future.device)
+    v_before = None
+    v_after = None
+    adv = 0.0
     if value_bundle is not None:
         v_before = _joint_value_score_standalone(
             value_bundle,
@@ -2955,95 +4020,32 @@ def apply_joint_repair_advantage_gate(
         )
         if v_before is not None and v_after is not None:
             adv = float(v_after - v_before)
-            tau = float(getattr(cfg, "joint_pair_repair_advantage_threshold", 0.0))
-            passed = adv > tau
-            delta_future_np = np.asarray(
-                (repaired_future.detach().float().cpu().reshape(-1) - current_future.detach().float().cpu().reshape(-1)).numpy(),
-                dtype=np.float32,
-            )
-            delta_action_np = np.asarray(
-                (repaired_action.detach().float().cpu().reshape(-1) - current_action.detach().float().cpu().reshape(-1)).numpy(),
-                dtype=np.float32,
-            )
-            pending_np = _repair_pending_to_summary_exec(pending_effect)
-            if pending_np is None:
-                pending_np = delta_future_np.copy()
-            info = {
-                "joint_repair_advantage_used": True,
-                "joint_repair_advantage_mode": "strict_value_diff",
-                "joint_repair_advantage_reason": "value_accept" if passed else "value_reject",
-                "joint_repair_advantage_pred": float(adv),
-                "joint_repair_advantage_value_before": float(v_before),
-                "joint_repair_advantage_value_after": float(v_after),
-                "joint_repair_advantage_threshold": float(tau),
-                "joint_repair_advantage_passed": bool(passed),
-                "joint_repair_advantage_future_delta_norm": float(np.linalg.norm(delta_future_np)),
-                "joint_repair_advantage_action_delta_norm": float(np.linalg.norm(delta_action_np)),
-                "joint_repair_advantage_pending_norm": float(np.linalg.norm(pending_np)),
-                **repair_info,
-            }
-            if not passed:
-                return current_future, current_action, info
-            return repaired_future, repaired_action, info
-
-    state_np = np.asarray(current_state, dtype=np.float32).reshape(-1)
-    future_arr = np.asarray(current_future.detach().float().cpu().numpy(), dtype=np.float32)
-    future_np = _joint_pair_future_summary_exec(future_arr).reshape(-1) if future_arr.ndim == 2 else future_arr.reshape(-1)
-    action_np = np.asarray(current_action.detach().float().cpu().numpy(), dtype=np.float32).reshape(-1)
-    repaired_future_arr = np.asarray(repaired_future.detach().float().cpu().numpy(), dtype=np.float32)
-    repaired_future_np = _joint_pair_future_summary_exec(repaired_future_arr).reshape(-1) if repaired_future_arr.ndim == 2 else repaired_future_arr.reshape(-1)
-    repaired_action_np = np.asarray(repaired_action.detach().float().cpu().numpy(), dtype=np.float32).reshape(-1)
-    delta_future_np = (repaired_future_np - future_np).astype(np.float32)
-    delta_action_np = (repaired_action_np - action_np).astype(np.float32)
-    pending_np = _repair_pending_to_summary_exec(pending_effect)
-    if pending_np is None or pending_np.size != delta_future_np.size:
-        pending_np = delta_future_np.copy()
-
-    task_to_id = bundle.get("repair_critic_task_to_id", {})
-    task_names = bundle.get("repair_critic_task_names", [])
-    if task not in task_to_id:
-        return current_future, current_action, {
-            "joint_repair_advantage_used": False,
-            "joint_repair_advantage_reason": "critic_task_missing",
-            **repair_info,
-        }
-    task_onehot = np.zeros((len(task_names),), dtype=np.float32)
-    task_onehot[int(task_to_id[task])] = 1.0
-    stage_np = np.asarray([float(subtask_index or 0) / 5.0], dtype=np.float32)
-    feat = np.concatenate([state_np, future_np, action_np, delta_future_np, delta_action_np, pending_np, task_onehot, stage_np], axis=0).astype(np.float32)
-    expected_dim = int(bundle.get("repair_critic_input_dim", feat.size))
-    if feat.size != expected_dim:
-        return current_future, current_action, {
-            "joint_repair_advantage_used": False,
-            "joint_repair_advantage_reason": f"critic_dim_mismatch:{feat.size}!={expected_dim}",
-            **repair_info,
-        }
-    critic: JointRepairCriticMLP = bundle["repair_critic_model"]
-    with torch.no_grad():
-        out = critic(torch.from_numpy(feat).unsqueeze(0).to(current_future.device))
-        adv_norm = float(out["advantage"].reshape(-1)[0].item())
-        logit = float(out["logit"].reshape(-1)[0].item())
-    adv = float(adv_norm * float(bundle.get("repair_critic_advantage_scale", 1.0)))
-    tau = float(getattr(cfg, "joint_pair_repair_advantage_threshold", 0.0))
-    logit_tau = float(getattr(cfg, "joint_pair_repair_advantage_logit_threshold", 0.0))
-    passed = adv > tau and logit > logit_tau
+    _, score_after_info = _joint_score_gate_info(
+        cfg,
+        task=task,
+        subtask_index=int(subtask_index or 0),
+        current_state=current_state,
+        base_future=score_base_future,
+        target_future=repaired_future,
+        target_action=repaired_action,
+        target_transition=target_transition,
+        prefix="joint_repair_score_after",
+    )
     info = {
         "joint_repair_advantage_used": True,
-        "joint_repair_advantage_mode": "critic_fallback",
-        "joint_repair_advantage_reason": "critic_accept" if passed else "critic_reject",
+        "joint_repair_advantage_mode": "joint_score_repair",
+        "joint_repair_advantage_reason": "joint_score_repair",
         "joint_repair_advantage_pred": float(adv),
-        "joint_repair_advantage_pred_norm": float(adv_norm),
-        "joint_repair_advantage_logit": float(logit),
-        "joint_repair_advantage_threshold": float(tau),
-        "joint_repair_advantage_logit_threshold": float(logit_tau),
-        "joint_repair_advantage_passed": bool(passed),
+        "joint_repair_advantage_value_before": None if v_before is None else float(v_before),
+        "joint_repair_advantage_value_after": None if v_after is None else float(v_after),
+        "joint_repair_advantage_passed": True,
         "joint_repair_advantage_future_delta_norm": float(np.linalg.norm(delta_future_np)),
         "joint_repair_advantage_action_delta_norm": float(np.linalg.norm(delta_action_np)),
         "joint_repair_advantage_pending_norm": float(np.linalg.norm(pending_np)),
+        **score_gate_info,
+        **score_after_info,
         **repair_info,
     }
-    if not passed:
-        return current_future, current_action, info
     return repaired_future, repaired_action, info
 
 
@@ -3854,18 +4856,18 @@ def select_joint_pair_target_future(
             target_action = (1.0 - gen_mix) * target_action + gen_mix * generated_action.to(dtype=target_action.dtype, device=target_action.device)
         action_gen_info["joint_pair_action_generator_mix"] = float(gen_mix)
     repair_info = {}
-    repaired_future, repaired_action, repair_info = _joint_pair_apply_repair(
-        bundle,
+    target_future, target_action, repair_info = apply_coupled_correction(
+        cfg,
+        mode="slow",
         task=task,
         subtask_index=int(subtask_index or 0),
         current_state=current_state,
-        target_future=target_future,
-        target_action=target_action,
+        current_future=target_future,
+        current_action=target_action,
+        pending_effect=None,
+        base_future_for_score=base_future,
         target_transition=best.get("state_transition"),
     )
-    if bool(repair_info.get("joint_pair_repair_used", False)):
-        target_future = repaired_future
-        target_action = repaired_action
     coupling_prior_info = {}
     if bool(getattr(cfg, "joint_pair_repair_with_coupling_prior", False)):
         target_future, target_action, coupling_prior_info = apply_dynamic_coupling_candidate_prior(
@@ -3881,8 +4883,8 @@ def select_joint_pair_target_future(
     init_action = target_action.detach().clone()
     refine_info = None
     verify_info = {}
-    verify_enabled = bool(getattr(cfg, "joint_pair_verify_acceptance", False))
-    refine_enabled = bool(getattr(cfg, "joint_pair_refine_fallback", False))
+    verify_enabled = False
+    refine_enabled = False
     refine_steps = int(getattr(cfg, "joint_pair_refine_steps", 0))
     if verify_enabled:
         verify_info = verify_joint_pair_hypothesis(
@@ -5313,6 +6315,82 @@ def maybe_save_action_trace(cfg, actions):
     return str(path)
 
 
+def _runtime_tensor_to_np(value, fallback_shape=(0,)):
+    if value is None:
+        return np.zeros(fallback_shape, dtype=np.float32)
+    try:
+        if torch.is_tensor(value):
+            return value.detach().float().cpu().numpy().astype(np.float32)
+        return np.asarray(value, dtype=np.float32)
+    except Exception:
+        return np.zeros(fallback_shape, dtype=np.float32)
+
+
+def maybe_save_joint_belief_transition_row(
+    cfg,
+    *,
+    sequence_index,
+    subtask_index,
+    task,
+    lang_text,
+    step,
+    state_before,
+    state_after,
+    action,
+    h_future_before,
+    h_action_before,
+    h_future_after,
+    h_action_after,
+    action_remain_before,
+    action_remain_after,
+    info,
+):
+    if not bool(getattr(cfg, "collect_joint_belief_transition", False)):
+        return None
+    trace_dir = str(getattr(cfg, "joint_belief_transition_trace_dir", "") or "")
+    rows_path = str(getattr(cfg, "joint_belief_transition_rows_path", "") or "")
+    if not trace_dir or not rows_path:
+        raise RuntimeError(
+            "collect_joint_belief_transition=True but rows/trace paths are not initialized"
+        )
+    current = int(getattr(cfg, "_joint_belief_transition_count", 0))
+    out_dir = Path(trace_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    feature_rel = f"joint_belief_transition/row_{current:07d}.npz"
+    feature_path = out_dir / f"row_{current:07d}.npz"
+    np.savez_compressed(
+        feature_path,
+        state_before=np.asarray(state_before, dtype=np.float32).reshape(-1),
+        state_after=np.asarray(state_after, dtype=np.float32).reshape(-1),
+        action=np.asarray(action, dtype=np.float32).reshape(-1),
+        h_future_before=_runtime_tensor_to_np(h_future_before),
+        h_action_before=_runtime_tensor_to_np(h_action_before),
+        h_future_after=_runtime_tensor_to_np(h_future_after),
+        h_action_after=_runtime_tensor_to_np(h_action_after),
+        action_remain_before=_runtime_tensor_to_np(action_remain_before),
+        action_remain_after=_runtime_tensor_to_np(action_remain_after),
+    )
+    row = {
+        "row_id": current,
+        "sequence_index": int(sequence_index),
+        "subtask_index": int(subtask_index or 0),
+        "task": str(task),
+        "lang_text": str(lang_text),
+        "step": int(step),
+        "feature_path": feature_rel,
+    }
+    for key, value in dict(info or {}).items():
+        if isinstance(value, (str, bool, int, float)) or value is None:
+            row[key] = value
+    rows_file = Path(rows_path)
+    rows_file.parent.mkdir(parents=True, exist_ok=True)
+    with rows_file.open("a") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.flush()
+    cfg._joint_belief_transition_count = current + 1
+    return str(feature_path)
+
+
 def action_trace_summary(actions):
     if not actions:
         return {"num_actions": 0, "action_dim": 0}
@@ -6509,6 +7587,8 @@ def rollout_with_lang_text(
             model.future_feature_mode = "override"
             model.override_future_feature = override_future_feature
         obs = env.get_obs()
+        coupling_first_pass = bool(getattr(cfg, "dynamic_coupling_first_pass", False))
+        coupling_control_enabled = bool(retry_mode or coupling_first_pass)
         strong_gt_start_raw = snapshot_env_raw(env) if collect_strong_gt else None
         base_annotation = val_annotations[subtask][0]
         goal = lang_embeddings.get_lang_goal(base_annotation)
@@ -6516,10 +7596,10 @@ def rollout_with_lang_text(
 
         model.reset()
         retry_score_base_future = None
-        if retry_mode and override_action_intent is not None:
+        if coupling_control_enabled and override_action_intent is not None:
             model.override_action_intent = override_action_intent
         elif (
-            retry_mode
+            coupling_control_enabled
             and override_future_feature is not None
             and bool(joint_pair_memory_free_mode(cfg))
             and bool(getattr(cfg, "dynamic_coupling_online", False))
@@ -6543,6 +7623,58 @@ def rollout_with_lang_text(
         model._last_dynamic_coupling_info_persist = dict(
             getattr(model, "_last_joint_hypothesis_init_info", {}) or {}
         )
+        first_pass_base_future = None
+        if (
+            coupling_first_pass
+            and override_future_feature is None
+            and bool(getattr(cfg, "dynamic_coupling_online", False))
+        ):
+            try:
+                from policy_evaluation.oracle_hypothesis_rollout import defi_future_feature
+
+                first_pass_base_future = defi_future_feature(model, obs, lang_text).detach().to(model.device)
+                finite_info = {}
+                first_pass_base_future = _finite_tensor_or_none(
+                    first_pass_base_future,
+                    name="dynamic_coupling_first_pass_future",
+                    info=finite_info,
+                )
+                model._last_dynamic_coupling_info_persist.update(finite_info)
+                if first_pass_base_future is not None:
+                    model.future_feature_mode = "override"
+                    model.override_future_feature = first_pass_base_future
+                if first_pass_base_future is not None and bool(getattr(cfg, "dynamic_coupling_generate_action_intent", False)):
+                    init_action_intent, init_info = generate_initial_joint_action_intent(
+                        cfg,
+                        env,
+                        model,
+                        obs,
+                        lang_text,
+                        subtask,
+                        int(subtask_index or 0),
+                        first_pass_base_future,
+                    )
+                    model._last_joint_hypothesis_init_info = dict(init_info)
+                    if init_action_intent is not None:
+                        # z_a is normally used as the persistent belief/action
+                        # latent for T/D. Only write it into the DeFi policy
+                        # decoder when explicitly requested.
+                        if bool(getattr(cfg, "dynamic_coupling_apply_action_intent_to_policy", False)):
+                            model.override_action_intent = init_action_intent
+                        model._last_dynamic_coupling_action_intent_persist = init_action_intent.detach().float().cpu()
+                model._last_dynamic_coupling_info_persist.update(
+                    {
+                        "dynamic_coupling_first_pass_target_initialized": first_pass_base_future is not None,
+                        "dynamic_coupling_first_pass_target_source": "gfdm_future",
+                    }
+                )
+            except Exception as exc:
+                model._last_dynamic_coupling_info_persist.update(
+                    {
+                        "dynamic_coupling_first_pass_target_initialized": False,
+                        "dynamic_coupling_first_pass_target_error": str(exc),
+                    }
+                )
         if retry_mode and override_future_feature is not None:
             from policy_evaluation.oracle_hypothesis_rollout import defi_future_feature
 
@@ -6575,11 +7707,45 @@ def rollout_with_lang_text(
             "dynamic_coupling_first_applied_step": None,
             "dynamic_coupling_last_applied_step": None,
             "dynamic_coupling_max_final_shift_norm": 0.0,
+            "chunk_effect_used_count": 0,
+            "chunk_effect_decision_count": 0,
+            "chunk_effect_any_used": False,
+            "chunk_effect_last_runtime_type": None,
+            "chunk_effect_last_decision": None,
+            "chunk_effect_last_residual_norm": None,
+            "chunk_effect_min_residual_norm": None,
+            "chunk_effect_max_residual_norm": None,
+            "chunk_effect_last_transition_cos": None,
+            "chunk_effect_min_transition_cos": None,
+            "chunk_effect_max_transition_cos": None,
+            "chunk_effect_last_success_prob": None,
+            "chunk_effect_min_success_prob": None,
+            "chunk_effect_max_success_prob": None,
         }
-        repair_gate_last_info = {}
-        coupling_target_future = override_future_feature.detach().clone() if override_future_feature is not None else None
+        if override_future_feature is not None:
+            coupling_target_future = override_future_feature.detach().clone()
+        elif first_pass_base_future is not None:
+            coupling_target_future = first_pass_base_future.detach().clone()
+        else:
+            coupling_target_future = None
+        persistent_hypothesis = bool(getattr(cfg, "dynamic_coupling_persistent_hypothesis", False))
+        joint_execution_update = bool(getattr(cfg, "joint_execution_update", False))
+        hypothesis_future_t = coupling_target_future.detach().clone() if coupling_target_future is not None else None
+        hypothesis_action_t = None
+        initial_action_intent = getattr(model, "override_action_intent", None)
+        if not torch.is_tensor(initial_action_intent):
+            initial_action_intent = getattr(model, "_last_dynamic_coupling_action_intent_persist", None)
+        if torch.is_tensor(initial_action_intent):
+            hypothesis_action_t = initial_action_intent.detach().clone().to(model.device)
         for step in range(cfg.ep_len):
-            if coupling_target_future is not None and bool(getattr(cfg, "dynamic_coupling_online", False)):
+            collect_jbt = bool(getattr(cfg, "collect_joint_belief_transition", False))
+            jbt_saved = False
+            active_target_future = hypothesis_future_t if persistent_hypothesis and hypothesis_future_t is not None else coupling_target_future
+            if (
+                active_target_future is not None
+                and bool(getattr(cfg, "dynamic_coupling_online", False))
+                and not joint_execution_update
+            ):
                 every_k = max(1, int(getattr(cfg, "dynamic_coupling_gate_every_k", 1)))
                 start_step = max(0, int(getattr(cfg, "dynamic_coupling_gate_start_step", 0)))
                 # Gate relative to start_step so start_step=1,every_k=4 means
@@ -6598,46 +7764,287 @@ def rollout_with_lang_text(
                     persist_info.update(coupling_agg_info)
                     model._last_dynamic_coupling_info_persist = persist_info
                 else:
-                    corrected_future_t, generated_action_intent_t, coupling_info = apply_dynamic_coupling_future(
+                    corrected_future_t, generated_action_intent_t, coupling_info = apply_coupled_correction(
                         cfg,
-                        env,
-                        model,
-                        obs,
-                        lang_text,
-                        subtask,
-                        int(subtask_index or 0),
-                        coupling_target_future,
-                        recent_actions,
+                        mode="fast",
+                        task=subtask,
+                        subtask_index=int(subtask_index or 0),
+                        env=env,
+                        model=model,
+                        obs=obs,
+                        lang_text=lang_text,
+                        slow_target_future=active_target_future,
+                        recent_actions=recent_actions,
                     )
-                    repair_gate_last_info = {}
-                    if (
-                        retry_mode
-                        and bool(getattr(cfg, "joint_pair_repair_advantage_gate", False))
-                        and generated_action_intent_t is not None
-                    ):
-                        pending_proxy_t = corrected_future_t.detach() - coupling_target_future.detach()
-                        gated_future_t, gated_action_t, repair_gate_info = apply_joint_repair_advantage_gate(
-                            cfg,
-                            task=subtask,
-                            subtask_index=int(subtask_index or 0),
-                            current_state=current_state,
-                            current_future=corrected_future_t,
-                            current_action=generated_action_intent_t,
-                            pending_effect=pending_proxy_t,
+                    if persistent_hypothesis and not joint_execution_update:
+                        future_update_mix = float(getattr(cfg, "dynamic_coupling_hypothesis_future_update_mix", 1.0))
+                        action_update_mix = float(getattr(cfg, "dynamic_coupling_hypothesis_action_update_mix", 1.0))
+                        future_update_mix = float(np.clip(future_update_mix, 0.0, 1.0))
+                        action_update_mix = float(np.clip(action_update_mix, 0.0, 1.0))
+                        prev_future_t = hypothesis_future_t.detach().clone() if hypothesis_future_t is not None else active_target_future.detach().clone()
+                        if corrected_future_t is not None:
+                            hypothesis_future_t = prev_future_t + future_update_mix * (corrected_future_t.detach() - prev_future_t)
+                            corrected_future_t = hypothesis_future_t
+                        if generated_action_intent_t is not None:
+                            candidate_action_t = generated_action_intent_t.detach().to(model.device)
+                            if hypothesis_action_t is None:
+                                prev_action_t = candidate_action_t.clone()
+                                hypothesis_action_t = candidate_action_t.clone()
+                            else:
+                                prev_action_t = hypothesis_action_t.detach().clone()
+                                hypothesis_action_t = hypothesis_action_t + action_update_mix * (candidate_action_t - hypothesis_action_t)
+                            generated_action_intent_t = hypothesis_action_t
+                            action_delta_norm = float(torch.norm((hypothesis_action_t - prev_action_t).reshape(-1), p=2).item())
+                        else:
+                            action_delta_norm = 0.0
+                        coupling_info = dict(coupling_info)
+                        coupling_info.update(
+                            {
+                                "persistent_hypothesis_used": True,
+                                "persistent_hypothesis_future_update_mix": future_update_mix,
+                                "persistent_hypothesis_action_update_mix": action_update_mix,
+                                "persistent_hypothesis_future_delta_norm": float(
+                                    torch.norm((hypothesis_future_t - prev_future_t).reshape(-1), p=2).item()
+                                )
+                                if hypothesis_future_t is not None
+                                else 0.0,
+                                "persistent_hypothesis_action_delta_norm": action_delta_norm,
+                            }
                         )
-                        repair_gate_last_info = dict(repair_gate_info)
-                        corrected_future_t = gated_future_t
-                        generated_action_intent_t = gated_action_t
-                    model.future_feature_mode = "override"
-                    model.override_future_feature = corrected_future_t
-                    if retry_mode and generated_action_intent_t is not None:
-                        model.override_action_intent = generated_action_intent_t
-                        model._last_dynamic_coupling_action_intent_persist = generated_action_intent_t.detach().float().cpu()
-                    elif retry_mode and override_action_intent is not None:
+                    else:
+                        coupling_info = dict(coupling_info)
+                        coupling_info["persistent_hypothesis_used"] = bool(persistent_hypothesis and joint_execution_update)
+                        if joint_execution_update:
+                            coupling_info["joint_execution_update_deferred"] = True
+                    corrected_future_t = _finite_tensor_or_none(
+                        corrected_future_t,
+                        name="dynamic_coupling_corrected_future",
+                        info=coupling_last_info,
+                    )
+                    generated_action_intent_t = _finite_tensor_or_none(
+                        generated_action_intent_t,
+                        name="dynamic_coupling_generated_action_intent",
+                        info=coupling_last_info,
+                    )
+                    if corrected_future_t is not None:
+                        model.future_feature_mode = "override"
+                        model.override_future_feature = corrected_future_t
+                    else:
+                        model.override_future_feature = None
+                    coupling_last_info = dict(coupling_info)
+                    if coupling_control_enabled and generated_action_intent_t is not None:
+                        if not joint_execution_update:
+                            model._last_dynamic_coupling_action_intent_persist = generated_action_intent_t.detach().float().cpu()
+                            if bool(getattr(cfg, "dynamic_coupling_apply_action_intent_to_policy", False)):
+                                model.override_action_intent = generated_action_intent_t
+                        remaining_action_chunk = model.get_remaining_action_seq(pad_to_full=True) if hasattr(model, "get_remaining_action_seq") else None
+                        if remaining_action_chunk is not None:
+                            current_state_for_delta = _joint_pair_state_from_raw(snapshot_env_raw(env))
+                            from policy_evaluation.oracle_hypothesis_rollout import defi_future_feature
+
+                            current_future_for_delta = defi_future_feature(model, obs, lang_text).detach().to(model.device)
+                            base_summary_exec = _joint_pair_future_summary_exec(
+                                current_future_for_delta.detach().float().cpu().numpy().astype(np.float32)
+                            )
+                            target_summary_exec = _joint_pair_future_summary_exec(
+                                corrected_future_t.detach().float().cpu().numpy().astype(np.float32)
+                            )
+                            if joint_update_payload is not None:
+                                # Unified U(h_t, s_t, a_t, s_{t+1}) replaces the separate phi scorer.
+                                chunk_effect_payload = None
+                                chunk_effect_info = {
+                                    "chunk_effect_used": False,
+                                    "chunk_effect_reason": "replaced_by_joint_execution_update",
+                                }
+                            else:
+                                chunk_effect_payload, chunk_effect_info = predict_remaining_chunk_effect(
+                                    cfg,
+                                    model,
+                                    task=subtask,
+                                    subtask_index=int(subtask_index or 0),
+                                    current_state=current_state_for_delta,
+                                    base_summary_exec=base_summary_exec,
+                                    target_summary_exec=target_summary_exec,
+                                    remaining_action_chunk=remaining_action_chunk,
+                                )
+                            coupling_last_info.update(chunk_effect_info)
+                            if chunk_effect_info.get("chunk_effect_used", False):
+                                coupling_agg_info["chunk_effect_used_count"] += 1
+                                coupling_agg_info["chunk_effect_any_used"] = True
+                                coupling_agg_info["chunk_effect_last_runtime_type"] = chunk_effect_info.get(
+                                    "chunk_effect_runtime_type"
+                                )
+                                residual_norm = chunk_effect_info.get("chunk_effect_residual_norm")
+                                transition_cos = chunk_effect_info.get("chunk_effect_transition_cos")
+                                success_prob = chunk_effect_info.get("chunk_effect_success_prob")
+                                if isinstance(residual_norm, (int, float)) and np.isfinite(float(residual_norm)):
+                                    residual_norm = float(residual_norm)
+                                    coupling_agg_info["chunk_effect_last_residual_norm"] = residual_norm
+                                    coupling_agg_info["chunk_effect_min_residual_norm"] = (
+                                        residual_norm
+                                        if coupling_agg_info["chunk_effect_min_residual_norm"] is None
+                                        else min(float(coupling_agg_info["chunk_effect_min_residual_norm"]), residual_norm)
+                                    )
+                                    coupling_agg_info["chunk_effect_max_residual_norm"] = (
+                                        residual_norm
+                                        if coupling_agg_info["chunk_effect_max_residual_norm"] is None
+                                        else max(float(coupling_agg_info["chunk_effect_max_residual_norm"]), residual_norm)
+                                    )
+                                if isinstance(transition_cos, (int, float)) and np.isfinite(float(transition_cos)):
+                                    transition_cos = float(transition_cos)
+                                    coupling_agg_info["chunk_effect_last_transition_cos"] = transition_cos
+                                    coupling_agg_info["chunk_effect_min_transition_cos"] = (
+                                        transition_cos
+                                        if coupling_agg_info["chunk_effect_min_transition_cos"] is None
+                                        else min(float(coupling_agg_info["chunk_effect_min_transition_cos"]), transition_cos)
+                                    )
+                                    coupling_agg_info["chunk_effect_max_transition_cos"] = (
+                                        transition_cos
+                                        if coupling_agg_info["chunk_effect_max_transition_cos"] is None
+                                        else max(float(coupling_agg_info["chunk_effect_max_transition_cos"]), transition_cos)
+                                    )
+                                if isinstance(success_prob, (int, float)) and np.isfinite(float(success_prob)):
+                                    success_prob = float(success_prob)
+                                    coupling_agg_info["chunk_effect_last_success_prob"] = success_prob
+                                    coupling_agg_info["chunk_effect_min_success_prob"] = (
+                                        success_prob
+                                        if coupling_agg_info["chunk_effect_min_success_prob"] is None
+                                        else min(float(coupling_agg_info["chunk_effect_min_success_prob"]), success_prob)
+                                    )
+                                    coupling_agg_info["chunk_effect_max_success_prob"] = (
+                                        success_prob
+                                        if coupling_agg_info["chunk_effect_max_success_prob"] is None
+                                        else max(float(coupling_agg_info["chunk_effect_max_success_prob"]), success_prob)
+                                    )
+                            delta_action_t, delta_action_info = predict_delta_action_repair(
+                                cfg,
+                                model,
+                                task=subtask,
+                                subtask_index=int(subtask_index or 0),
+                                current_state=current_state_for_delta,
+                                current_action_chunk=remaining_action_chunk,
+                                base_summary_exec=base_summary_exec,
+                                target_summary_exec=target_summary_exec,
+                            )
+                            coupling_last_info.update(delta_action_info)
+                            if joint_execution_update:
+                                chunk_decision = decide_joint_execution_suffix(cfg, chunk_effect_payload, delta_action_t)
+                            else:
+                                chunk_decision = decide_chunk_intervention(cfg, chunk_effect_payload, delta_action_t)
+                            if persistent_hypothesis and joint_execution_update:
+                                joint_gate = float(chunk_decision.get("joint_execution_gate", 0.0) or 0.0)
+                                prev_future_t = hypothesis_future_t.detach().clone() if hypothesis_future_t is not None else active_target_future.detach().clone()
+                                if corrected_future_t is not None:
+                                    hypothesis_future_t = prev_future_t + joint_gate * (corrected_future_t.detach() - prev_future_t)
+                                    corrected_future_t = hypothesis_future_t
+                                    model.override_future_feature = corrected_future_t
+                                if generated_action_intent_t is not None:
+                                    candidate_action_t = generated_action_intent_t.detach().to(model.device)
+                                    if hypothesis_action_t is None:
+                                        prev_action_t = candidate_action_t.clone()
+                                        hypothesis_action_t = candidate_action_t.clone()
+                                    else:
+                                        prev_action_t = hypothesis_action_t.detach().clone()
+                                        hypothesis_action_t = hypothesis_action_t + joint_gate * (candidate_action_t - hypothesis_action_t)
+                                    generated_action_intent_t = hypothesis_action_t
+                                    model._last_dynamic_coupling_action_intent_persist = hypothesis_action_t.detach().float().cpu()
+                                    if bool(getattr(cfg, "dynamic_coupling_apply_action_intent_to_policy", False)):
+                                        model.override_action_intent = generated_action_intent_t
+                                    action_delta_norm = float(torch.norm((hypothesis_action_t - prev_action_t).reshape(-1), p=2).item())
+                                else:
+                                    action_delta_norm = 0.0
+                                coupling_last_info.update(
+                                    {
+                                        "persistent_hypothesis_used": True,
+                                        "joint_execution_update_applied": True,
+                                        "persistent_hypothesis_update_gate": joint_gate,
+                                        "persistent_hypothesis_future_delta_norm": float(
+                                            torch.norm((hypothesis_future_t - prev_future_t).reshape(-1), p=2).item()
+                                        )
+                                        if hypothesis_future_t is not None
+                                        else 0.0,
+                                        "persistent_hypothesis_action_delta_norm": action_delta_norm,
+                                    }
+                                )
+                            coupling_agg_info["chunk_effect_decision_count"] += 1
+                            coupling_agg_info["chunk_effect_last_decision"] = str(chunk_decision["decision"])
+                            coupling_last_info.update(
+                                {
+                                    "dynamic_coupling_chunk_decision": str(chunk_decision["decision"]),
+                                    "dynamic_coupling_chunk_decision_reason": str(chunk_decision["decision_reason"]),
+                                    "dynamic_coupling_chunk_residual_norm": float(chunk_decision["residual_norm"]),
+                                    "dynamic_coupling_chunk_compat": float(chunk_decision["compat"]),
+                                    "dynamic_coupling_chunk_success_prob": float(chunk_decision["success_prob"]),
+                                    "dynamic_coupling_chunk_keep_threshold": float(chunk_decision["keep_threshold"]),
+                                    "dynamic_coupling_chunk_replan_threshold": float(chunk_decision["replan_threshold"]),
+                                    "dynamic_coupling_chunk_success_threshold": float(chunk_decision["success_threshold"]),
+                                    "dynamic_coupling_chunk_low_compat_threshold": float(chunk_decision["low_compat_threshold"]),
+                                }
+                            )
+                            if (
+                                chunk_decision["decision"] == "repair_suffix"
+                                and delta_action_t is not None
+                                and hasattr(model, "patch_remaining_action_seq")
+                            ):
+                                patch_mix = float(getattr(cfg, "dynamic_coupling_delta_action_repair_mix", 1.0))
+                                patch_info = model.patch_remaining_action_seq(
+                                    delta_action_t,
+                                    mode="delta",
+                                    mix=patch_mix,
+                                )
+                                coupling_last_info.update(
+                                    {
+                                        "dynamic_coupling_delta_action_patch_requested": True,
+                                        "dynamic_coupling_delta_action_patch_mix": patch_mix,
+                                        **{f"dynamic_coupling_delta_action_patch_{k}": v for k, v in patch_info.items()},
+                                    }
+                                )
+                            elif chunk_decision["decision"] == "replan":
+                                model.pred_action_seq = None
+                                model.rollout_step_counter = 0
+                                if persistent_hypothesis:
+                                    hypothesis_future_t = corrected_future_t.detach().clone() if corrected_future_t is not None else coupling_target_future
+                                    hypothesis_action_t = generated_action_intent_t.detach().clone() if generated_action_intent_t is not None else None
+                                coupling_last_info.update(
+                                    {
+                                        "dynamic_coupling_full_replan_requested": True,
+                                        "dynamic_coupling_replan_from_step": int(step),
+                                        "persistent_hypothesis_reset_by_replan": bool(persistent_hypothesis),
+                                    }
+                                )
+                            else:
+                                coupling_last_info.update(
+                                    {
+                                        "dynamic_coupling_delta_action_patch_requested": False,
+                                        "dynamic_coupling_full_replan_requested": False,
+                                    }
+                                )
+                        use_delta_action_repair = bool(getattr(cfg, "dynamic_coupling_delta_action_repair_ckpt", "") or "")
+                        if (
+                            not bool(getattr(cfg, "dynamic_coupling_chunk_effect_ckpt", "") or "")
+                            and not use_delta_action_repair
+                            and bool(getattr(cfg, "dynamic_coupling_patch_remaining_actions", False))
+                            and hasattr(model, "patch_remaining_action_seq")
+                        ):
+                            patch_mode = str(getattr(cfg, "dynamic_coupling_patch_mode", "replace") or "replace")
+                            patch_mix = float(getattr(cfg, "dynamic_coupling_patch_mix", 1.0))
+                            patch_info = model.patch_remaining_action_seq(
+                                generated_action_intent_t,
+                                mode=patch_mode,
+                                mix=patch_mix,
+                            )
+                            coupling_last_info.update(
+                                {
+                                    "dynamic_coupling_action_patch_requested": True,
+                                    "dynamic_coupling_action_patch_mode": patch_mode,
+                                    "dynamic_coupling_action_patch_mix": patch_mix,
+                                    **{f"dynamic_coupling_action_patch_{k}": v for k, v in patch_info.items()},
+                                }
+                            )
+                    elif coupling_control_enabled and override_action_intent is not None:
                         model.override_action_intent = override_action_intent
                         if torch.is_tensor(override_action_intent):
                             model._last_dynamic_coupling_action_intent_persist = override_action_intent.detach().float().cpu()
-                    coupling_last_info = dict(coupling_info)
                     model._last_dynamic_coupling_info = dict(coupling_last_info)
                     if coupling_last_info.get("dynamic_coupling_used", False):
                         coupling_agg_info["dynamic_coupling_used_count"] += 1
@@ -6658,7 +8065,6 @@ def rollout_with_lang_text(
                         coupling_agg_info["dynamic_coupling_any_action_generated"] = True
                     persist_info = dict(coupling_last_info)
                     persist_info.update(dict(getattr(model, "_last_joint_hypothesis_init_info", {}) or {}))
-                    persist_info.update(repair_gate_last_info)
                     if retry_mode and corrected_future_t is not None:
                         final_action_for_score = getattr(model, "override_action_intent", None)
                         final_score_info = score_joint_hypothesis_candidate(
@@ -6683,15 +8089,566 @@ def rollout_with_lang_text(
                             )
                     persist_info.update(coupling_agg_info)
                     model._last_dynamic_coupling_info_persist = persist_info
+            jbt_future_before = hypothesis_future_t.detach().clone() if torch.is_tensor(hypothesis_future_t) else None
+            if torch.is_tensor(hypothesis_action_t):
+                jbt_action_before = hypothesis_action_t.detach().clone()
+            elif torch.is_tensor(getattr(model, "override_action_intent", None)):
+                jbt_action_before = getattr(model, "override_action_intent").detach().clone()
+            else:
+                jbt_action_before = None
+            jbt_shadow_info = {}
+            if collect_jbt and (jbt_future_before is None or jbt_action_before is None):
+                shadow_future, shadow_action, jbt_shadow_info = compute_shadow_joint_hypothesis(
+                    cfg,
+                    env,
+                    model,
+                    obs,
+                    lang_text,
+                    subtask,
+                    int(subtask_index or 0),
+                )
+                if jbt_future_before is None:
+                    jbt_future_before = shadow_future
+                if jbt_action_before is None:
+                    jbt_action_before = shadow_action
             action = model.step(obs, goal)
+            try:
+                action_dbg = action.detach().cpu().numpy() if hasattr(action, "detach") else np.asarray(action)
+            except Exception:
+                action_dbg = np.asarray(action)
+            action_dbg = np.asarray(action_dbg, dtype=np.float32)
+            if bool(getattr(cfg, "debug_action_before_env_step", False)) and step < int(
+                getattr(cfg, "debug_action_steps", 5)
+            ):
+                print(f"\n[DEBUG ACTION] step={step} value={action_dbg}", flush=True)
+                print(f"[DEBUG ACTION] step={step} shape={action_dbg.shape}", flush=True)
+                print(f"[DEBUG ACTION] step={step} finite={np.isfinite(action_dbg).all()}", flush=True)
+                print(
+                    f"[DEBUG ACTION] step={step} minmax={np.nanmin(action_dbg)} {np.nanmax(action_dbg)}",
+                    flush=True,
+                )
+            if not np.isfinite(action_dbg).all():
+                raise FloatingPointError(
+                    f"non-finite action before env.step: subtask={subtask} step={step} value={action_dbg}"
+                )
             if bool(getattr(cfg, "collect_action_trace", False)):
                 action_trace.append(_flatten_action_for_probe(action))
             recent_actions.append(_flatten_action_for_probe(action))
             keep_actions = int(getattr(cfg, "dynamic_coupling_keep_actions", 64))
             if keep_actions > 0 and len(recent_actions) > keep_actions:
                 recent_actions = recent_actions[-keep_actions:]
+            state_before_step = _joint_pair_state_from_raw(snapshot_env_raw(env))
+            jbt_action_remain_before = (
+                model.get_remaining_action_seq(pad_to_full=True)
+                if bool(getattr(cfg, "collect_joint_belief_transition", False)) and hasattr(model, "get_remaining_action_seq")
+                else None
+            )
             obs, _, _, current_info = env.step(action)
+            state_after_step = _joint_pair_state_from_raw(snapshot_env_raw(env))
             last_info = current_info
+            jbt_future_after_shadow = None
+            jbt_action_after_shadow = None
+            jbt_shadow_after_info = {}
+            if collect_jbt and not (
+                joint_execution_update
+                and hypothesis_future_t is not None
+                and bool(getattr(cfg, "dynamic_coupling_online", False))
+            ):
+                jbt_future_after_shadow, jbt_action_after_shadow, jbt_shadow_after_info = compute_shadow_joint_hypothesis(
+                    cfg,
+                    env,
+                    model,
+                    obs,
+                    lang_text,
+                    subtask,
+                    int(subtask_index or 0),
+                )
+            if (
+                joint_execution_update
+                and hypothesis_future_t is not None
+                and bool(getattr(cfg, "dynamic_coupling_online", False))
+            ):
+                every_k = max(1, int(getattr(cfg, "dynamic_coupling_gate_every_k", 1)))
+                start_step = max(0, int(getattr(cfg, "dynamic_coupling_gate_start_step", 0)))
+                if step >= start_step and ((step - start_step) % every_k) == 0:
+                    corrected_future_t, generated_action_intent_t, coupling_info = apply_coupled_correction(
+                        cfg,
+                        mode="fast",
+                        task=subtask,
+                        subtask_index=int(subtask_index or 0),
+                        env=env,
+                        model=model,
+                        obs=obs,
+                        lang_text=lang_text,
+                        slow_target_future=hypothesis_future_t,
+                        recent_actions=recent_actions,
+                    )
+                    coupling_last_info = dict(coupling_info)
+                    chunk_decision = None
+                    if coupling_control_enabled:
+                        remaining_action_chunk = (
+                            model.get_remaining_action_seq(pad_to_full=True)
+                            if hasattr(model, "get_remaining_action_seq")
+                            else None
+                        )
+                        clean_controller = bool(getattr(cfg, "joint_belief_clean_controller", False))
+                        target_future_for_delta = (
+                            hypothesis_future_t
+                            if clean_controller
+                            else (corrected_future_t if corrected_future_t is not None else hypothesis_future_t)
+                        )
+                        if remaining_action_chunk is not None and target_future_for_delta is not None:
+                            current_state_for_delta = _joint_pair_state_from_raw(snapshot_env_raw(env))
+                            from policy_evaluation.oracle_hypothesis_rollout import defi_future_feature
+
+                            current_future_for_delta = defi_future_feature(model, obs, lang_text).detach().to(model.device)
+                            base_summary_exec = _joint_pair_future_summary_exec(
+                                current_future_for_delta.detach().float().cpu().numpy().astype(np.float32)
+                            )
+                            target_summary_exec = _joint_pair_future_summary_exec(
+                                target_future_for_delta.detach().float().cpu().numpy().astype(np.float32)
+                            )
+                            joint_update_payload, joint_update_info = predict_joint_execution_update(
+                                cfg,
+                                model,
+                                task=subtask,
+                                subtask_index=int(subtask_index or 0),
+                                state_start=state_before_step,
+                                state_end=current_state_for_delta,
+                                base_summary_exec=base_summary_exec,
+                                target_summary_exec=target_summary_exec,
+                                remaining_action_chunk=remaining_action_chunk,
+                                executed_action=action_dbg,
+                            )
+                            coupling_last_info.update(joint_update_info)
+                            if joint_update_payload is not None:
+                                chunk_effect_payload = None
+                                chunk_effect_info = {
+                                    "chunk_effect_used": False,
+                                    "chunk_effect_reason": "replaced_by_joint_belief_transition",
+                                }
+                            else:
+                                chunk_effect_payload, chunk_effect_info = predict_remaining_chunk_effect(
+                                    cfg,
+                                    model,
+                                    task=subtask,
+                                    subtask_index=int(subtask_index or 0),
+                                    current_state=current_state_for_delta,
+                                    base_summary_exec=base_summary_exec,
+                                    target_summary_exec=target_summary_exec,
+                                    remaining_action_chunk=remaining_action_chunk,
+                                )
+                            coupling_last_info.update(chunk_effect_info)
+                            if chunk_effect_info.get("chunk_effect_used", False):
+                                coupling_agg_info["chunk_effect_used_count"] += 1
+                                coupling_agg_info["chunk_effect_any_used"] = True
+                                coupling_agg_info["chunk_effect_last_runtime_type"] = chunk_effect_info.get(
+                                    "chunk_effect_runtime_type"
+                                )
+                                residual_norm = chunk_effect_info.get("chunk_effect_residual_norm")
+                                transition_cos = chunk_effect_info.get("chunk_effect_transition_cos")
+                                success_prob = chunk_effect_info.get("chunk_effect_success_prob")
+                                if isinstance(residual_norm, (int, float)) and np.isfinite(float(residual_norm)):
+                                    residual_norm = float(residual_norm)
+                                    coupling_agg_info["chunk_effect_last_residual_norm"] = residual_norm
+                                    coupling_agg_info["chunk_effect_min_residual_norm"] = (
+                                        residual_norm
+                                        if coupling_agg_info["chunk_effect_min_residual_norm"] is None
+                                        else min(float(coupling_agg_info["chunk_effect_min_residual_norm"]), residual_norm)
+                                    )
+                                    coupling_agg_info["chunk_effect_max_residual_norm"] = (
+                                        residual_norm
+                                        if coupling_agg_info["chunk_effect_max_residual_norm"] is None
+                                        else max(float(coupling_agg_info["chunk_effect_max_residual_norm"]), residual_norm)
+                                    )
+                                if isinstance(transition_cos, (int, float)) and np.isfinite(float(transition_cos)):
+                                    transition_cos = float(transition_cos)
+                                    coupling_agg_info["chunk_effect_last_transition_cos"] = transition_cos
+                                    coupling_agg_info["chunk_effect_min_transition_cos"] = (
+                                        transition_cos
+                                        if coupling_agg_info["chunk_effect_min_transition_cos"] is None
+                                        else min(float(coupling_agg_info["chunk_effect_min_transition_cos"]), transition_cos)
+                                    )
+                                    coupling_agg_info["chunk_effect_max_transition_cos"] = (
+                                        transition_cos
+                                        if coupling_agg_info["chunk_effect_max_transition_cos"] is None
+                                        else max(float(coupling_agg_info["chunk_effect_max_transition_cos"]), transition_cos)
+                                    )
+                                if isinstance(success_prob, (int, float)) and np.isfinite(float(success_prob)):
+                                    success_prob = float(success_prob)
+                                    coupling_agg_info["chunk_effect_last_success_prob"] = success_prob
+                                    coupling_agg_info["chunk_effect_min_success_prob"] = (
+                                        success_prob
+                                        if coupling_agg_info["chunk_effect_min_success_prob"] is None
+                                        else min(float(coupling_agg_info["chunk_effect_min_success_prob"]), success_prob)
+                                    )
+                                    coupling_agg_info["chunk_effect_max_success_prob"] = (
+                                        success_prob
+                                        if coupling_agg_info["chunk_effect_max_success_prob"] is None
+                                        else max(float(coupling_agg_info["chunk_effect_max_success_prob"]), success_prob)
+                                    )
+                            if joint_update_payload is not None:
+                                delta_action_t = joint_update_payload["action_delta"]
+                                delta_action_t = _finite_tensor_or_none(
+                                    delta_action_t,
+                                    name="joint_belief_transition_delta_action",
+                                    info=coupling_last_info,
+                                )
+                                delta_action_info = {
+                                    "delta_action_repair_used": True,
+                                    "delta_action_repair_applied": delta_action_t is not None,
+                                    "delta_action_repair_source": "joint_execution_update_mlp",
+                                    "delta_action_repair_delta_norm": float(
+                                        torch.norm(delta_action_t.reshape(-1), p=2).item()
+                                    )
+                                    if delta_action_t is not None
+                                    else 0.0,
+                                }
+                            else:
+                                delta_action_t, delta_action_info = predict_delta_action_repair(
+                                    cfg,
+                                    model,
+                                    task=subtask,
+                                    subtask_index=int(subtask_index or 0),
+                                    current_state=current_state_for_delta,
+                                    current_action_chunk=remaining_action_chunk,
+                                    base_summary_exec=base_summary_exec,
+                                    target_summary_exec=target_summary_exec,
+                                )
+                            coupling_last_info.update(delta_action_info)
+                            if joint_update_payload is not None:
+                                error = float(joint_update_payload["error"])
+                                direct_suffix = bool(getattr(cfg, "joint_belief_transition_direct_suffix", False))
+                                heuristic_gate = float(
+                                    np.clip(
+                                        max(0.0, error - float(getattr(cfg, "joint_execution_update_threshold", 1.0)))
+                                        * float(getattr(cfg, "joint_execution_update_gain", 1.0)),
+                                        float(getattr(cfg, "joint_execution_update_min_gate", 0.0)),
+                                        float(getattr(cfg, "joint_execution_update_max_gate", 0.3)),
+                                    )
+                                )
+                                learned_gate_raw = float(joint_update_payload.get("learned_gate", float("nan")))
+                                gate_mode = str(getattr(cfg, "joint_execution_gate_mode", "heuristic"))
+                                if gate_mode in {"learned", "learned_or_heuristic"} and np.isfinite(learned_gate_raw):
+                                    joint_gate = float(
+                                        np.clip(
+                                            learned_gate_raw * float(getattr(cfg, "joint_execution_update_max_gate", 0.3)),
+                                            float(getattr(cfg, "joint_execution_update_min_gate", 0.0)),
+                                            float(getattr(cfg, "joint_execution_update_max_gate", 0.3)),
+                                        )
+                                    )
+                                    gate_source = "learned"
+                                else:
+                                    joint_gate = heuristic_gate
+                                    gate_source = "heuristic"
+                                success_prob = float(joint_update_payload["success_prob"])
+                                sparse_suffix = bool(getattr(cfg, "joint_belief_transition_sparse_suffix", False))
+                                min_learned_gate = float(getattr(cfg, "joint_belief_transition_min_learned_gate", 0.08))
+                                max_success_prob = float(getattr(cfg, "joint_belief_transition_max_success_prob", 0.25))
+                                predicted_mode = str(joint_update_payload.get("mode", "") or "")
+                                suffix_decision = "keep"
+                                suffix_reason = "joint_belief_transition_default_keep"
+                                if clean_controller and predicted_mode:
+                                    confidence = float(joint_update_payload.get("confidence", success_prob))
+                                    min_confidence = float(getattr(cfg, "joint_belief_clean_min_confidence", 0.0))
+                                    mode_prob = joint_update_payload.get("mode_prob", None)
+                                    if torch.is_tensor(mode_prob):
+                                        keep_prob = float(mode_prob[:, 0].reshape(-1)[0].item())
+                                        patch_prob = float(mode_prob[:, 1].reshape(-1)[0].item())
+                                        replan_prob = float(mode_prob[:, 2].reshape(-1)[0].item())
+                                    else:
+                                        keep_prob = patch_prob = replan_prob = float("nan")
+                                    patch_min_prob = float(getattr(cfg, "joint_belief_clean_patch_min_prob", 0.6))
+                                    patch_margin = float(getattr(cfg, "joint_belief_clean_patch_margin", 0.1))
+                                    replan_min_prob = float(getattr(cfg, "joint_belief_clean_replan_min_prob", 0.7))
+                                    if confidence < min_confidence and not bool(getattr(cfg, "dynamic_coupling_disable_replan", False)):
+                                        sparse_triggered = False
+                                        suffix_decision = "replan"
+                                        suffix_reason = "clean_controller_low_confidence_replan"
+                                    elif (
+                                        predicted_mode == "patch"
+                                        and delta_action_t is not None
+                                        and np.isfinite(patch_prob)
+                                        and np.isfinite(keep_prob)
+                                        and patch_prob >= patch_min_prob
+                                        and patch_prob >= keep_prob + patch_margin
+                                    ):
+                                        sparse_triggered = True
+                                        suffix_decision = "repair_suffix"
+                                        suffix_reason = "clean_controller_D_mode_patch_confident"
+                                    elif (
+                                        predicted_mode == "replan"
+                                        and np.isfinite(replan_prob)
+                                        and replan_prob >= replan_min_prob
+                                        and not bool(getattr(cfg, "dynamic_coupling_disable_replan", False))
+                                    ):
+                                        sparse_triggered = False
+                                        suffix_decision = "replan"
+                                        suffix_reason = "clean_controller_D_mode_replan_confident"
+                                    else:
+                                        sparse_triggered = False
+                                        suffix_decision = "keep"
+                                        suffix_reason = f"clean_controller_D_mode_{predicted_mode}"
+                                    trigger_payload = {"used": False}
+                                    trigger_threshold = float("nan")
+                                    suffix_trigger_source = "factored_D_mode"
+                                elif predicted_mode:
+                                    sparse_triggered = predicted_mode == "patch"
+                                    trigger_payload = {"used": False}
+                                    trigger_threshold = float("nan")
+                                    suffix_trigger_source = "factored_D_mode"
+                                else:
+                                    sparse_triggered = (
+                                        (np.isfinite(learned_gate_raw) and learned_gate_raw >= min_learned_gate)
+                                        or success_prob <= max_success_prob
+                                    )
+                                    trigger_payload = predict_suffix_trigger_runtime(
+                                        load_suffix_trigger_runtime(cfg, model.device),
+                                        task=subtask,
+                                        subtask_index=int(subtask_index or 0),
+                                        chunk_decision={
+                                            "residual_norm": error,
+                                            "compat": float("nan"),
+                                            "success_prob": success_prob,
+                                            "joint_execution_learned_gate_raw": learned_gate_raw,
+                                            "joint_execution_gate": joint_gate,
+                                            "joint_execution_error": error,
+                                        },
+                                        coupling_info=coupling_last_info,
+                                    )
+                                    trigger_threshold = float(getattr(cfg, "suffix_trigger_mlp_threshold", 0.5))
+                                    if trigger_payload.get("used", False) and "prob" in trigger_payload:
+                                        sparse_triggered = bool(float(trigger_payload["prob"]) >= trigger_threshold)
+                                        suffix_trigger_source = "suffix_trigger_mlp"
+                                    else:
+                                        suffix_trigger_source = "joint_belief_thresholds"
+                                if not clean_controller:
+                                    suffix_decision = "repair_suffix" if delta_action_t is not None else "keep"
+                                    suffix_reason = "joint_belief_transition_direct_suffix"
+                                if predicted_mode and not clean_controller:
+                                    if predicted_mode == "patch" and delta_action_t is not None:
+                                        suffix_decision = "repair_suffix"
+                                    elif predicted_mode == "replan" and not bool(getattr(cfg, "dynamic_coupling_disable_replan", False)):
+                                        suffix_decision = "replan"
+                                    else:
+                                        suffix_decision = "keep"
+                                    suffix_reason = f"factored_D_mode_{predicted_mode}"
+                                if not clean_controller and not predicted_mode and direct_suffix and sparse_suffix:
+                                    suffix_decision = "repair_suffix" if delta_action_t is not None and sparse_triggered else "keep"
+                                    suffix_reason = (
+                                        f"{suffix_trigger_source}_trigger"
+                                        if sparse_triggered
+                                        else f"{suffix_trigger_source}_keep"
+                                    )
+                                if not clean_controller and not direct_suffix:
+                                    suffix_decision = (
+                                        "repair_suffix"
+                                        if delta_action_t is not None
+                                        and error >= float(getattr(cfg, "joint_execution_suffix_error_threshold", 1.0))
+                                        else "keep"
+                                    )
+                                    suffix_reason = "joint_execution_update_mlp_error_gate"
+                                chunk_decision = {
+                                    "decision": suffix_decision,
+                                    "decision_reason": suffix_reason,
+                                    "residual_norm": float(error),
+                                    "compat": float("nan"),
+                                    "success_prob": success_prob,
+                                    "keep_threshold": float(getattr(cfg, "dynamic_coupling_chunk_keep_threshold", 0.35)),
+                                    "replan_threshold": float(getattr(cfg, "dynamic_coupling_chunk_replan_threshold", 0.75)),
+                                    "success_threshold": float(getattr(cfg, "dynamic_coupling_chunk_success_threshold", 0.5)),
+                                    "low_compat_threshold": float(getattr(cfg, "dynamic_coupling_chunk_low_compat_threshold", 0.0)),
+                                    "disable_replan": True,
+                                    "joint_execution_update_used": True,
+                                    "joint_execution_error": error,
+                                    "joint_execution_gate": joint_gate,
+                                    "joint_execution_gate_mode": gate_mode,
+                                    "joint_execution_gate_source": gate_source,
+                                    "joint_execution_heuristic_gate": heuristic_gate,
+                                    "joint_execution_learned_gate_raw": learned_gate_raw,
+                                    "joint_belief_transition_used": True,
+                                    "joint_belief_clean_controller": clean_controller,
+                                    "joint_belief_transition_direct_suffix": direct_suffix,
+                                    "joint_belief_transition_sparse_suffix": sparse_suffix,
+                                    "joint_belief_transition_sparse_triggered": sparse_triggered,
+                                    "joint_belief_transition_min_learned_gate": min_learned_gate,
+                                    "joint_belief_transition_max_success_prob": max_success_prob,
+                                    "joint_belief_transition_predicted_mode": predicted_mode,
+                                    "joint_belief_transition_mode_keep_prob": float(joint_update_payload.get("mode_prob", torch.zeros((1, 3), device=model.device))[:, 0].reshape(-1)[0].item()) if torch.is_tensor(joint_update_payload.get("mode_prob", None)) else float("nan"),
+                                    "joint_belief_transition_mode_patch_prob": float(joint_update_payload.get("mode_prob", torch.zeros((1, 3), device=model.device))[:, 1].reshape(-1)[0].item()) if torch.is_tensor(joint_update_payload.get("mode_prob", None)) else float("nan"),
+                                    "joint_belief_transition_mode_replan_prob": float(joint_update_payload.get("mode_prob", torch.zeros((1, 3), device=model.device))[:, 2].reshape(-1)[0].item()) if torch.is_tensor(joint_update_payload.get("mode_prob", None)) else float("nan"),
+                                    "suffix_trigger_mlp_used": bool(trigger_payload.get("used", False)),
+                                    "suffix_trigger_mlp_prob": float(trigger_payload.get("prob", float("nan"))),
+                                    "suffix_trigger_mlp_threshold": trigger_threshold,
+                                    "suffix_trigger_source": suffix_trigger_source,
+                                }
+                            else:
+                                chunk_decision = decide_joint_execution_suffix(cfg, chunk_effect_payload, delta_action_t)
+                            coupling_agg_info["chunk_effect_decision_count"] += 1
+                            coupling_agg_info["chunk_effect_last_decision"] = str(chunk_decision["decision"])
+                            coupling_last_info.update(
+                                {
+                                    "dynamic_coupling_chunk_decision": str(chunk_decision["decision"]),
+                                    "dynamic_coupling_chunk_decision_reason": str(chunk_decision["decision_reason"]),
+                                    "dynamic_coupling_chunk_residual_norm": float(chunk_decision["residual_norm"]),
+                                    "dynamic_coupling_chunk_compat": float(chunk_decision["compat"]),
+                                    "dynamic_coupling_chunk_success_prob": float(chunk_decision["success_prob"]),
+                                    "joint_execution_update_used": True,
+                                    "joint_execution_update_after_step": True,
+                                    "joint_belief_transition_used": bool(joint_update_payload is not None),
+                                    "joint_belief_transition_direct_suffix": bool(getattr(cfg, "joint_belief_transition_direct_suffix", False)),
+                                    "joint_belief_transition_sparse_suffix": bool(getattr(cfg, "joint_belief_transition_sparse_suffix", False)),
+                                    "joint_belief_transition_sparse_triggered": bool(chunk_decision.get("joint_belief_transition_sparse_triggered", False)),
+                                    "joint_execution_error": float(chunk_decision.get("joint_execution_error", 0.0)),
+                                    "joint_execution_gate": float(chunk_decision.get("joint_execution_gate", 0.0)),
+                                }
+                            )
+                            joint_gate = float(chunk_decision.get("joint_execution_gate", 0.0) or 0.0)
+                            if bool(getattr(cfg, "joint_belief_clean_controller", False)):
+                                # Clean T/D mode keeps full-token z_f/z_a untouched; this
+                                # summary-level controller adapts only the cached action suffix.
+                                joint_gate = 0.0
+                            prev_future_t = hypothesis_future_t.detach().clone()
+                            if corrected_future_t is not None:
+                                hypothesis_future_t = prev_future_t + joint_gate * (corrected_future_t.detach() - prev_future_t)
+                                model.future_feature_mode = "override"
+                                model.override_future_feature = hypothesis_future_t
+                            if generated_action_intent_t is not None:
+                                candidate_action_t = generated_action_intent_t.detach().to(model.device)
+                                if hypothesis_action_t is None:
+                                    prev_action_t = candidate_action_t.clone()
+                                    hypothesis_action_t = candidate_action_t.clone()
+                                else:
+                                    prev_action_t = hypothesis_action_t.detach().clone()
+                                    hypothesis_action_t = hypothesis_action_t + joint_gate * (candidate_action_t - hypothesis_action_t)
+                                model._last_dynamic_coupling_action_intent_persist = hypothesis_action_t.detach().float().cpu()
+                                if bool(getattr(cfg, "dynamic_coupling_apply_action_intent_to_policy", False)):
+                                    model.override_action_intent = hypothesis_action_t
+                                action_delta_norm = float(torch.norm((hypothesis_action_t - prev_action_t).reshape(-1), p=2).item())
+                            else:
+                                action_delta_norm = 0.0
+                            coupling_last_info.update(
+                                {
+                                    "persistent_hypothesis_used": True,
+                                    "joint_execution_update_applied": True,
+                                    "persistent_hypothesis_update_gate": joint_gate,
+                                    "persistent_hypothesis_future_delta_norm": float(
+                                        torch.norm((hypothesis_future_t - prev_future_t).reshape(-1), p=2).item()
+                                    ),
+                                    "persistent_hypothesis_action_delta_norm": action_delta_norm,
+                                }
+                            )
+                            if (
+                                chunk_decision["decision"] == "repair_suffix"
+                                and delta_action_t is not None
+                                and hasattr(model, "patch_remaining_action_seq")
+                            ):
+                                patch_mix = float(getattr(cfg, "dynamic_coupling_delta_action_repair_mix", 1.0))
+                                if bool(getattr(cfg, "joint_belief_transition_direct_suffix", False)) and joint_update_payload is not None:
+                                    # In direct transition mode, U's gate is the continuous suffix update magnitude.
+                                    patch_mix *= joint_gate
+                                patch_info = model.patch_remaining_action_seq(delta_action_t, mode="delta", mix=patch_mix)
+                                coupling_last_info.update(
+                                    {
+                                        "dynamic_coupling_delta_action_patch_requested": True,
+                                        "dynamic_coupling_delta_action_patch_mix": patch_mix,
+                                        **{f"dynamic_coupling_delta_action_patch_{k}": v for k, v in patch_info.items()},
+                                    }
+                                )
+                            elif chunk_decision["decision"] == "replan":
+                                model.pred_action_seq = None
+                                model.rollout_step_counter = 0
+                                coupling_last_info.update(
+                                    {
+                                        "dynamic_coupling_delta_action_patch_requested": False,
+                                        "dynamic_coupling_full_replan_requested": True,
+                                        "dynamic_coupling_replan_from_step": int(step),
+                                    }
+                                )
+                            else:
+                                coupling_last_info.update(
+                                    {
+                                        "dynamic_coupling_delta_action_patch_requested": False,
+                                        "dynamic_coupling_full_replan_requested": False,
+                                    }
+                                )
+                    maybe_save_joint_belief_transition_row(
+                        cfg,
+                        sequence_index=int(getattr(cfg, "_runtime_sequence_index", -1)),
+                        subtask_index=int(subtask_index or 0),
+                        task=subtask,
+                        lang_text=lang_text,
+                        step=step,
+                        state_before=state_before_step,
+                        state_after=state_after_step,
+                        action=action_dbg,
+                        h_future_before=jbt_future_before,
+                        h_action_before=jbt_action_before,
+                        h_future_after=hypothesis_future_t,
+                        h_action_after=hypothesis_action_t,
+                        action_remain_before=jbt_action_remain_before,
+                        action_remain_after=(
+                            model.get_remaining_action_seq(pad_to_full=True)
+                            if hasattr(model, "get_remaining_action_seq")
+                            else None
+                        ),
+                        info=coupling_last_info,
+                    )
+                    jbt_saved = True
+                    model._last_dynamic_coupling_info = dict(coupling_last_info)
+                    if coupling_last_info.get("dynamic_coupling_used", False):
+                        coupling_agg_info["dynamic_coupling_used_count"] += 1
+                        coupling_agg_info["dynamic_coupling_any_used"] = True
+                    if coupling_last_info.get("dynamic_coupling_applied", False):
+                        coupling_agg_info["dynamic_coupling_applied_count"] += 1
+                        coupling_agg_info["dynamic_coupling_any_applied"] = True
+                        if coupling_agg_info["dynamic_coupling_first_applied_step"] is None:
+                            coupling_agg_info["dynamic_coupling_first_applied_step"] = int(step)
+                        coupling_agg_info["dynamic_coupling_last_applied_step"] = int(step)
+                        coupling_agg_info["dynamic_coupling_max_final_shift_norm"] = max(
+                            float(coupling_agg_info["dynamic_coupling_max_final_shift_norm"]),
+                            float(coupling_last_info.get("dynamic_coupling_final_shift_norm", 0.0) or 0.0),
+                        )
+                        model._last_dynamic_coupling_future_persist = hypothesis_future_t.detach().float().cpu()
+                    if coupling_last_info.get("dynamic_coupling_action_generated", False):
+                        coupling_agg_info["dynamic_coupling_action_generated_count"] += 1
+                        coupling_agg_info["dynamic_coupling_any_action_generated"] = True
+                    persist_info = dict(coupling_last_info)
+                    persist_info.update(dict(getattr(model, "_last_joint_hypothesis_init_info", {}) or {}))
+                    persist_info.update(coupling_agg_info)
+                    model._last_dynamic_coupling_info_persist = persist_info
+            if collect_jbt and not jbt_saved:
+                shadow_info = dict(coupling_last_info or {})
+                shadow_info.update(jbt_shadow_info)
+                shadow_info.update({f"after_{k}": v for k, v in jbt_shadow_after_info.items()})
+                shadow_info.update(
+                    {
+                        "joint_belief_transition_shadow_only": True,
+                        "joint_execution_update_used": False,
+                    }
+                )
+                maybe_save_joint_belief_transition_row(
+                    cfg,
+                    sequence_index=int(getattr(cfg, "_runtime_sequence_index", -1)),
+                    subtask_index=int(subtask_index or 0),
+                    task=subtask,
+                    lang_text=lang_text,
+                    step=step,
+                    state_before=state_before_step,
+                    state_after=state_after_step,
+                    action=action_dbg,
+                    h_future_before=jbt_future_before,
+                    h_action_before=jbt_action_before,
+                    h_future_after=jbt_future_after_shadow,
+                    h_action_after=jbt_action_after_shadow,
+                    action_remain_before=jbt_action_remain_before,
+                    action_remain_after=(
+                        model.get_remaining_action_seq(pad_to_full=True)
+                        if hasattr(model, "get_remaining_action_seq")
+                        else None
+                    ),
+                    info=shadow_info,
+                )
             current_task_info = task_oracle.get_task_info_for_set(start_info, current_info, {subtask})
             if len(current_task_info) > 0:
                 if collect_strong_gt:
@@ -8089,17 +10046,53 @@ def evaluate_sequence_memory(
                 continue
             return success_counter
 
-        success = original_rollout(
-            env,
-            model,
-            task_checker,
-            cfg,
-            subtask,
-            lang_embeddings,
-            val_annotations,
-            record,
-            rollout_video,
-        )
+        first_pass_coupling = bool(getattr(cfg, "dynamic_coupling_first_pass", False))
+        # Shadow transition collection must use this rollout path because the
+        # official baseline rollout has no hooks for h_t / action-buffer logging.
+        shadow_transition_collection = bool(getattr(cfg, "collect_joint_belief_transition", False))
+        if first_pass_coupling or shadow_transition_collection:
+            success, first_pass_steps = rollout_with_lang_text(
+                env,
+                model,
+                task_checker,
+                cfg,
+                subtask,
+                lang_embeddings,
+                val_annotations,
+                base_lang_text,
+                None,
+                None,
+                subtask_index=sub_idx,
+                retry_mode=False,
+            )
+            coupling_row_info = dict(getattr(model, "_last_dynamic_coupling_info_persist", {}) or {})
+            logs.append(
+                {
+                    "sequence_index": seq_idx,
+                    "subtask_index": sub_idx,
+                    "task": subtask,
+                    "success": bool(success),
+                    "steps": int(first_pass_steps),
+                    "used_reflection_retry": False,
+                    "lang_text": base_lang_text,
+                    "dynamic_coupling_first_pass": bool(first_pass_coupling),
+                    "joint_belief_transition_shadow_collection": bool(shadow_transition_collection),
+                    **coupling_row_info,
+                }
+            )
+        else:
+            success = original_rollout(
+                env,
+                model,
+                task_checker,
+                cfg,
+                subtask,
+                lang_embeddings,
+                val_annotations,
+                record,
+                rollout_video,
+            )
+            first_pass_steps = -1
         if success:
             row = make_state_memory_row(
                 f"R_seq{seq_idx}_sub{sub_idx}",
@@ -8107,24 +10100,30 @@ def evaluate_sequence_memory(
                 sub_idx,
                 subtask,
                 True,
-                -1,
+                int(first_pass_steps),
                 "recent_state",
             )
             update_runtime_state_memory(recent_memory, runtime_key_state_memory, row, cfg.memory_recent_k, cfg.memory_runtime_key_max)
-            logs.append(
-                {
-                    "sequence_index": seq_idx,
-                    "subtask_index": sub_idx,
-                    "task": subtask,
-                    "success": True,
-                    "used_reflection_retry": False,
-                    "lang_text": base_lang_text,
-                }
-            )
+            if not first_pass_coupling and not shadow_transition_collection:
+                logs.append(
+                    {
+                        "sequence_index": seq_idx,
+                        "subtask_index": sub_idx,
+                        "task": subtask,
+                        "success": True,
+                        "used_reflection_retry": False,
+                        "lang_text": base_lang_text,
+                    }
+                )
             success_counter += 1
             if record:
                 rollout_video.draw_outcome(True)
             continue
+
+        if bool(getattr(cfg, "disable_retry_after_first_pass", False)):
+            if record:
+                rollout_video.draw_outcome(False)
+            return success_counter
 
         reset_env_raw(env, step_start_raw)
         if bool(getattr(cfg, "no_qwen_reflection", False)):
@@ -8189,28 +10188,27 @@ def evaluate_sequence_memory(
                         "joint_pair_reason": "memory_free_gfdm_init",
                     }
                     joint_pair_info.update(init_info)
-                    if (
-                        bool(getattr(cfg, "joint_pair_repair_ckpt", "") or "")
-                        and bool(getattr(cfg, "joint_pair_repair_advantage_gate", False))
-                        and joint_pair_action_intent is not None
-                    ):
-                        repaired_future, repaired_action, repair_info = apply_joint_repair_advantage_gate(
-                            cfg,
-                            task=subtask,
-                            subtask_index=int(sub_idx or 0),
-                            current_state=current_state,
-                            current_future=base_future,
-                            current_action=joint_pair_action_intent,
-                            pending_effect=None,
-                        )
-                        joint_pair_info.update(repair_info)
+                    repaired_future, repaired_action, repair_info = maybe_apply_initial_slow_correction(
+                        cfg,
+                        task=subtask,
+                        subtask_index=int(sub_idx or 0),
+                        current_state=current_state,
+                        base_future=base_future,
+                        initial_future=base_future,
+                        initial_action=joint_pair_action_intent,
+                        target_transition=None,
+                    )
+                    joint_pair_info.update(repair_info)
+                    if repaired_future is not None:
+                        joint_pair_target_future = repaired_future
+                    if repaired_action is not None:
+                        joint_pair_action_intent = repaired_action
+                    if bool(repair_info.get("joint_repair_advantage_used", False)):
                         if bool(repair_info.get("joint_repair_advantage_passed", False)):
-                            joint_pair_target_future = repaired_future
-                            joint_pair_action_intent = repaired_action
-                            joint_pair_info["joint_pair_reason"] = "memory_free_gfdm_repair_accept"
+                            joint_pair_info["joint_pair_reason"] = "memory_free_gfdm_slow_repair_accept"
                         else:
                             joint_pair_info["joint_pair_reason"] = str(
-                                repair_info.get("joint_repair_advantage_reason", "memory_free_gfdm_repair_reject")
+                                repair_info.get("joint_repair_advantage_reason", "memory_free_gfdm_slow_repair_reject")
                             )
             corrected_future = joint_pair_target_future if joint_pair_target_future is not None else base_future
             retry_success, retry_steps = rollout_with_lang_text(
@@ -8528,6 +10526,8 @@ def evaluate_policy_memory(model, env, lang_embeddings, cfg, num_procs, procs_id
 
     key_memory_rows = load_key_memory_rows(Path(cfg.memory_key_path)) if cfg.memory_key_path else []
     runtime_key_state_memory = []
+    progress_path = Path(save_dir) / "sequence_progress.jsonl" if save_dir is not None else None
+    partial_results_path = Path(save_dir) / "partial_results.json" if save_dir is not None else None
 
     class StreamingJsonlLogs(list):
         def __init__(self, path):
@@ -8548,6 +10548,30 @@ def evaluate_policy_memory(model, env, lang_embeddings, cfg, num_procs, procs_id
                 self._handle.close()
                 self._handle = None
 
+    def append_progress(row):
+        if progress_path is None:
+            return
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        with progress_path.open("a") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+            handle.flush()
+
+    def write_partial_results(results):
+        if partial_results_path is None:
+            return
+        horizon = max((len(sequence) for _, sequence in eval_sequences), default=5)
+        payload = {
+            "checkpoint": str(checkpoint),
+            "num_sequences_total": len(eval_sequences),
+            "num_sequences_finished": len(results),
+            "avg_seq_len": float(np.mean(results)) if results else 0.0,
+            "chain_sr": count_success_upto(results, horizon) if results else [],
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with partial_results_path.open("w") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+
     logs = StreamingJsonlLogs(Path(save_dir) / "memory_rollout_rows.jsonl" if save_dir is not None else None)
     strong_gt_logs = StreamingJsonlLogs(
         Path(save_dir) / "strong_gt_rows.jsonl"
@@ -8559,6 +10583,17 @@ def evaluate_policy_memory(model, env, lang_embeddings, cfg, num_procs, procs_id
         if save_dir is not None and bool(getattr(cfg, "collect_online_acceptance_rows", False))
         else None
     )
+    if save_dir is not None and bool(getattr(cfg, "collect_joint_belief_transition", False)):
+        with open_dict(cfg):
+            cfg.joint_belief_transition_rows_path = str(Path(save_dir) / "joint_belief_transition_rows.jsonl")
+            cfg.joint_belief_transition_trace_dir = str(Path(save_dir) / "joint_belief_transition")
+            cfg._joint_belief_transition_count = 0
+        print(
+            "[JBT_COLLECT] enabled "
+            f"rows={cfg.joint_belief_transition_rows_path} "
+            f"trace_dir={cfg.joint_belief_transition_trace_dir}",
+            flush=True,
+        )
     qwen = None
     adapter_bundle = None
 
@@ -8650,8 +10685,30 @@ def evaluate_policy_memory(model, env, lang_embeddings, cfg, num_procs, procs_id
 
     try:
         results = []
+        print(
+            f"[EVAL] checkpoint={checkpoint} save_dir={save_dir} num_sequences={len(eval_sequences)} "
+            f"num_procs={num_procs} proc_id={procs_id}",
+            flush=True,
+        )
         eval_sequences = tqdm(eval_sequences, position=0, leave=True)
         for i, (initial_state, eval_sequence) in enumerate(eval_sequences):
+            with open_dict(cfg):
+                cfg._runtime_sequence_index = int(i)
+            seq_start_time = time.time()
+            logs_len_before_sequence = len(logs)
+            task_names = [str(task) for task in eval_sequence]
+            print(
+                f"[EVAL][START] seq={i} tasks={task_names}",
+                flush=True,
+            )
+            append_progress(
+                {
+                    "event": "start",
+                    "sequence_index": int(i),
+                    "tasks": task_names,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
             record = record_video and (record_sequence_index < 0 or i == record_sequence_index)
             result = evaluate_sequence_memory(
                 env,
@@ -8674,6 +10731,37 @@ def evaluate_policy_memory(model, env, lang_embeddings, cfg, num_procs, procs_id
                 online_acceptance_logs,
             )
             results.append(result)
+            duration = time.time() - seq_start_time
+            last_rollout_row = logs[-1] if len(logs) > logs_len_before_sequence else {}
+            progress_runtime_info = {
+                key: value
+                for key, value in dict(last_rollout_row).items()
+                if str(key).startswith(
+                    (
+                        "dynamic_coupling_",
+                        "joint_execution_",
+                        "persistent_hypothesis_",
+                    )
+                )
+            }
+            print(
+                f"[EVAL][DONE] seq={i} success_len={result}/{len(eval_sequence)} "
+                f"duration_sec={duration:.2f}",
+                flush=True,
+            )
+            append_progress(
+                {
+                    "event": "done",
+                    "sequence_index": int(i),
+                    "tasks": task_names,
+                    "success_len": int(result),
+                    "sequence_len": int(len(eval_sequence)),
+                    "duration_sec": float(duration),
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    **progress_runtime_info,
+                }
+            )
+            write_partial_results(results)
             if record:
                 rollout_video._log_currentvideos_to_file(i, save_as_video=True)
                 rollout_video.videos = []
@@ -8779,6 +10867,17 @@ def main(cfg):
         model.process_device()
         model.eval()
         log_dir = get_log_dir(cfg.train_folder)
+        if bool(getattr(cfg, "collect_joint_belief_transition", False)):
+            with open_dict(cfg):
+                cfg.joint_belief_transition_rows_path = str(Path(log_dir) / "joint_belief_transition_rows.jsonl")
+                cfg.joint_belief_transition_trace_dir = str(Path(log_dir) / "joint_belief_transition")
+                cfg._joint_belief_transition_count = 0
+            print(
+                "[JBT_COLLECT_MAIN] enabled "
+                f"rows={cfg.joint_belief_transition_rows_path} "
+                f"trace_dir={cfg.joint_belief_transition_trace_dir}",
+                flush=True,
+            )
         if log_wandb:
             os.makedirs(log_dir / "wandb", exist_ok=True)
         evaluator = original_evaluate_policy if cfg.disable_memory_reflection else evaluate_policy_memory
@@ -9040,10 +11139,16 @@ if __name__ == "__main__":
     parser.add_argument("--print_strong_gt_rows", action="store_true")
     parser.add_argument("--collect_action_trace", action="store_true")
     parser.add_argument("--action_trace_dir", type=str, default="")
+    parser.add_argument("--collect_joint_belief_transition", action="store_true")
     parser.add_argument("--collect_online_acceptance_rows", action="store_true")
     parser.add_argument("--dynamic_coupling_operator_ckpt", type=str, default="")
     parser.add_argument("--dynamic_coupling_online", action="store_true")
+    parser.add_argument("--dynamic_coupling_first_pass", action="store_true")
     parser.add_argument("--dynamic_coupling_generate_action_intent", action="store_true")
+    parser.add_argument("--dynamic_coupling_apply_action_intent_to_policy", action="store_true")
+    parser.add_argument("--dynamic_coupling_persistent_hypothesis", action="store_true")
+    parser.add_argument("--dynamic_coupling_hypothesis_future_update_mix", type=float, default=1.0)
+    parser.add_argument("--dynamic_coupling_hypothesis_action_update_mix", type=float, default=1.0)
     parser.add_argument("--dynamic_coupling_need_gain", type=float, default=0.35)
     parser.add_argument("--dynamic_coupling_min_scale", type=float, default=0.5)
     parser.add_argument("--dynamic_coupling_max_scale", type=float, default=1.25)
@@ -9057,11 +11162,60 @@ if __name__ == "__main__":
     parser.add_argument("--dynamic_coupling_gate_start_step", type=int, default=0)
     parser.add_argument("--dynamic_coupling_gate_with_trigger", action="store_true")
     parser.add_argument("--dynamic_coupling_trigger_threshold", type=float, default=0.5)
+    parser.add_argument("--dynamic_coupling_patch_remaining_actions", action="store_true")
+    parser.add_argument("--dynamic_coupling_patch_mode", type=str, default="replace", choices=["replace", "delta", "mix"])
+    parser.add_argument("--dynamic_coupling_patch_mix", type=float, default=1.0)
+    parser.add_argument("--dynamic_coupling_delta_action_repair_ckpt", type=str, default="")
+    parser.add_argument("--dynamic_coupling_delta_action_repair_mix", type=float, default=1.0)
+    parser.add_argument("--dynamic_coupling_chunk_effect_ckpt", type=str, default="")
+    parser.add_argument("--dynamic_coupling_chunk_keep_threshold", type=float, default=0.35)
+    parser.add_argument("--dynamic_coupling_chunk_replan_threshold", type=float, default=0.75)
+    parser.add_argument("--dynamic_coupling_chunk_success_threshold", type=float, default=0.5)
+    parser.add_argument("--dynamic_coupling_chunk_low_compat_threshold", type=float, default=0.0)
+    parser.add_argument("--dynamic_coupling_disable_replan", action="store_true")
+    parser.add_argument("--dynamic_coupling_suffix_trigger_success_below", type=float, default=1.0)
+    parser.add_argument("--dynamic_coupling_suffix_trigger_residual_above", type=float, default=0.0)
+    parser.add_argument("--dynamic_coupling_suffix_trigger_compat_below", type=float, default=1.0)
+    parser.add_argument("--joint_execution_update", action="store_true")
+    parser.add_argument("--joint_execution_update_ckpt", type=str, default="")
+    parser.add_argument("--joint_belief_transition", action="store_true")
+    parser.add_argument("--joint_belief_transition_ckpt", type=str, default="")
+    parser.add_argument("--joint_belief_transition_direct_suffix", action="store_true")
+    parser.add_argument("--joint_belief_transition_sparse_suffix", action="store_true")
+    parser.add_argument("--joint_belief_transition_min_learned_gate", type=float, default=0.08)
+    parser.add_argument("--joint_belief_transition_max_success_prob", type=float, default=0.25)
+    parser.add_argument("--joint_belief_clean_controller", action="store_true")
+    parser.add_argument("--joint_belief_clean_min_confidence", type=float, default=0.0)
+    parser.add_argument("--joint_belief_clean_patch_min_prob", type=float, default=0.6)
+    parser.add_argument("--joint_belief_clean_patch_margin", type=float, default=0.1)
+    parser.add_argument("--joint_belief_clean_replan_min_prob", type=float, default=0.7)
+    parser.add_argument("--suffix_trigger_mlp_ckpt", type=str, default="")
+    parser.add_argument("--suffix_trigger_mlp_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--joint_execution_gate_mode",
+        choices=["heuristic", "learned", "learned_or_heuristic"],
+        default="heuristic",
+    )
+    parser.add_argument("--joint_execution_update_threshold", type=float, default=1.0)
+    parser.add_argument("--joint_execution_update_gain", type=float, default=1.0)
+    parser.add_argument("--joint_execution_update_min_gate", type=float, default=0.0)
+    parser.add_argument("--joint_execution_update_max_gate", type=float, default=0.3)
+    parser.add_argument("--joint_execution_suffix_error_threshold", type=float, default=1.0)
+    parser.add_argument("--joint_execution_error_residual_scale", type=float, default=30.0)
+    parser.add_argument("--joint_execution_error_success_target", type=float, default=0.05)
+    parser.add_argument("--joint_execution_error_compat_target", type=float, default=-0.1)
+    parser.add_argument("--joint_execution_error_success_weight", type=float, default=2.0)
+    parser.add_argument("--joint_execution_error_compat_weight", type=float, default=1.0)
+    parser.add_argument("--debug_action_before_env_step", action="store_true")
+    parser.add_argument("--debug_action_steps", type=int, default=5)
+    parser.add_argument("--disable_retry_after_first_pass", action="store_true")
 
     args = parser.parse_args()
+    print(f"[CLI] collect_joint_belief_transition={bool(args.collect_joint_belief_transition)}", flush=True)
 
     with initialize(config_path="../policy_conf", job_name="calvin_evaluate_all.yaml"):
         cfg = compose(config_name="calvin_evaluate_all.yaml")
+    _apply_checkpoint_model_compat_overrides(cfg, args.checkpoint_path)
     cfg.model.pretrained_model_path = args.video_model_path
     cfg.train_folder = args.action_model_folder
     cfg.model.text_encoder_path = args.clip_model_path
@@ -9293,10 +11447,16 @@ if __name__ == "__main__":
         cfg.print_strong_gt_rows = bool(args.print_strong_gt_rows)
         cfg.collect_action_trace = bool(args.collect_action_trace)
         cfg.action_trace_dir = args.action_trace_dir
+        cfg.collect_joint_belief_transition = bool(args.collect_joint_belief_transition)
         cfg.collect_online_acceptance_rows = bool(args.collect_online_acceptance_rows)
         cfg.dynamic_coupling_operator_ckpt = args.dynamic_coupling_operator_ckpt
         cfg.dynamic_coupling_online = bool(args.dynamic_coupling_online)
+        cfg.dynamic_coupling_first_pass = bool(args.dynamic_coupling_first_pass)
         cfg.dynamic_coupling_generate_action_intent = bool(args.dynamic_coupling_generate_action_intent)
+        cfg.dynamic_coupling_apply_action_intent_to_policy = bool(args.dynamic_coupling_apply_action_intent_to_policy)
+        cfg.dynamic_coupling_persistent_hypothesis = bool(args.dynamic_coupling_persistent_hypothesis)
+        cfg.dynamic_coupling_hypothesis_future_update_mix = float(args.dynamic_coupling_hypothesis_future_update_mix)
+        cfg.dynamic_coupling_hypothesis_action_update_mix = float(args.dynamic_coupling_hypothesis_action_update_mix)
         cfg.dynamic_coupling_need_gain = float(args.dynamic_coupling_need_gain)
         cfg.dynamic_coupling_min_scale = float(args.dynamic_coupling_min_scale)
         cfg.dynamic_coupling_max_scale = float(args.dynamic_coupling_max_scale)
@@ -9310,6 +11470,49 @@ if __name__ == "__main__":
         cfg.dynamic_coupling_gate_start_step = int(args.dynamic_coupling_gate_start_step)
         cfg.dynamic_coupling_gate_with_trigger = bool(args.dynamic_coupling_gate_with_trigger)
         cfg.dynamic_coupling_trigger_threshold = float(args.dynamic_coupling_trigger_threshold)
+        cfg.dynamic_coupling_patch_remaining_actions = bool(args.dynamic_coupling_patch_remaining_actions)
+        cfg.dynamic_coupling_patch_mode = args.dynamic_coupling_patch_mode
+        cfg.dynamic_coupling_patch_mix = float(args.dynamic_coupling_patch_mix)
+        cfg.dynamic_coupling_delta_action_repair_ckpt = args.dynamic_coupling_delta_action_repair_ckpt
+        cfg.dynamic_coupling_delta_action_repair_mix = float(args.dynamic_coupling_delta_action_repair_mix)
+        cfg.dynamic_coupling_chunk_effect_ckpt = args.dynamic_coupling_chunk_effect_ckpt
+        cfg.dynamic_coupling_chunk_keep_threshold = float(args.dynamic_coupling_chunk_keep_threshold)
+        cfg.dynamic_coupling_chunk_replan_threshold = float(args.dynamic_coupling_chunk_replan_threshold)
+        cfg.dynamic_coupling_chunk_success_threshold = float(args.dynamic_coupling_chunk_success_threshold)
+        cfg.dynamic_coupling_chunk_low_compat_threshold = float(args.dynamic_coupling_chunk_low_compat_threshold)
+        cfg.dynamic_coupling_disable_replan = bool(args.dynamic_coupling_disable_replan)
+        cfg.dynamic_coupling_suffix_trigger_success_below = float(args.dynamic_coupling_suffix_trigger_success_below)
+        cfg.dynamic_coupling_suffix_trigger_residual_above = float(args.dynamic_coupling_suffix_trigger_residual_above)
+        cfg.dynamic_coupling_suffix_trigger_compat_below = float(args.dynamic_coupling_suffix_trigger_compat_below)
+        cfg.joint_belief_transition = bool(args.joint_belief_transition)
+        cfg.joint_belief_transition_ckpt = args.joint_belief_transition_ckpt
+        cfg.joint_belief_transition_direct_suffix = bool(args.joint_belief_transition_direct_suffix)
+        cfg.joint_belief_transition_sparse_suffix = bool(args.joint_belief_transition_sparse_suffix)
+        cfg.joint_belief_transition_min_learned_gate = float(args.joint_belief_transition_min_learned_gate)
+        cfg.joint_belief_transition_max_success_prob = float(args.joint_belief_transition_max_success_prob)
+        cfg.joint_belief_clean_controller = bool(args.joint_belief_clean_controller)
+        cfg.joint_belief_clean_min_confidence = float(args.joint_belief_clean_min_confidence)
+        cfg.joint_belief_clean_patch_min_prob = float(args.joint_belief_clean_patch_min_prob)
+        cfg.joint_belief_clean_patch_margin = float(args.joint_belief_clean_patch_margin)
+        cfg.joint_belief_clean_replan_min_prob = float(args.joint_belief_clean_replan_min_prob)
+        cfg.suffix_trigger_mlp_ckpt = args.suffix_trigger_mlp_ckpt
+        cfg.suffix_trigger_mlp_threshold = float(args.suffix_trigger_mlp_threshold)
+        cfg.joint_execution_update = bool(args.joint_execution_update or args.joint_belief_transition)
+        cfg.joint_execution_update_ckpt = args.joint_belief_transition_ckpt or args.joint_execution_update_ckpt
+        cfg.joint_execution_gate_mode = args.joint_execution_gate_mode
+        cfg.joint_execution_update_threshold = float(args.joint_execution_update_threshold)
+        cfg.joint_execution_update_gain = float(args.joint_execution_update_gain)
+        cfg.joint_execution_update_min_gate = float(args.joint_execution_update_min_gate)
+        cfg.joint_execution_update_max_gate = float(args.joint_execution_update_max_gate)
+        cfg.joint_execution_suffix_error_threshold = float(args.joint_execution_suffix_error_threshold)
+        cfg.joint_execution_error_residual_scale = float(args.joint_execution_error_residual_scale)
+        cfg.joint_execution_error_success_target = float(args.joint_execution_error_success_target)
+        cfg.joint_execution_error_compat_target = float(args.joint_execution_error_compat_target)
+        cfg.joint_execution_error_success_weight = float(args.joint_execution_error_success_weight)
+        cfg.joint_execution_error_compat_weight = float(args.joint_execution_error_compat_weight)
+        cfg.debug_action_before_env_step = bool(args.debug_action_before_env_step)
+        cfg.debug_action_steps = int(args.debug_action_steps)
+        cfg.disable_retry_after_first_pass = bool(args.disable_retry_after_first_pass)
         cfg._future_trace_count = 0
         cfg._channel_patch_count = 0
         cfg._action_trace_count = 0

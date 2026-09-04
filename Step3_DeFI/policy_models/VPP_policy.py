@@ -782,8 +782,97 @@ class VPP_Policy(pl.LightningModule):
         """
         self.plan = None
         self.latent_goal = None
+        self.pred_action_seq = None
         self.rollout_step_counter = 0
         self.override_action_intent = None
+
+    def patch_remaining_action_seq(self, candidate_seq, mode: str = "replace", mix: float = 1.0):
+        """
+        Patch the not-yet-executed suffix of the cached action chunk in place.
+
+        This is used by online correction logic when we want the next executor
+        step to consume an updated action sequence immediately, instead of
+        waiting for the next full chunk re-sampling boundary.
+        """
+        if self.pred_action_seq is None or candidate_seq is None:
+            return {
+                "patched": False,
+                "reason": "missing_cached_or_candidate_seq",
+            }
+
+        if not torch.is_tensor(candidate_seq):
+            candidate_seq = torch.as_tensor(
+                candidate_seq,
+                dtype=self.pred_action_seq.dtype,
+                device=self.pred_action_seq.device,
+            )
+        else:
+            candidate_seq = candidate_seq.to(
+                device=self.pred_action_seq.device,
+                dtype=self.pred_action_seq.dtype,
+            )
+
+        if candidate_seq.dim() == 2:
+            candidate_seq = candidate_seq.unsqueeze(0)
+        if candidate_seq.dim() != 3:
+            return {
+                "patched": False,
+                "reason": f"bad_candidate_dim_{candidate_seq.dim()}",
+            }
+
+        batch = min(int(self.pred_action_seq.shape[0]), int(candidate_seq.shape[0]))
+        start_idx = int(self.rollout_step_counter)
+        total_len = int(self.pred_action_seq.shape[1])
+        remaining = max(0, total_len - start_idx)
+        if remaining <= 0:
+            return {
+                "patched": False,
+                "reason": "no_remaining_actions",
+            }
+
+        overlap = min(remaining, int(candidate_seq.shape[1]))
+        if overlap <= 0:
+            return {
+                "patched": False,
+                "reason": "zero_overlap",
+            }
+
+        current_tail = self.pred_action_seq[:batch, start_idx : start_idx + overlap]
+        candidate_tail = candidate_seq[:batch, :overlap]
+        mode = str(mode or "replace").strip().lower()
+        mix = float(mix)
+
+        if mode == "delta":
+            patched_tail = current_tail + mix * candidate_tail
+        elif mode == "mix":
+            patched_tail = (1.0 - mix) * current_tail + mix * candidate_tail
+        else:
+            patched_tail = candidate_tail
+
+        self.pred_action_seq[:batch, start_idx : start_idx + overlap] = patched_tail
+        return {
+            "patched": True,
+            "mode": mode,
+            "mix": mix,
+            "start_idx": start_idx,
+            "overlap": overlap,
+            "remaining_before_patch": remaining,
+            "candidate_len": int(candidate_seq.shape[1]),
+        }
+
+    def get_remaining_action_seq(self, pad_to_full: bool = True):
+        if self.pred_action_seq is None:
+            return None
+        start_idx = int(self.rollout_step_counter)
+        total_len = int(self.pred_action_seq.shape[1])
+        if start_idx >= total_len:
+            return None
+        remain = self.pred_action_seq[:, start_idx:].detach().clone()
+        if not pad_to_full or remain.shape[1] == total_len:
+            return remain
+        padded = torch.zeros_like(self.pred_action_seq)
+        padded[:, : remain.shape[1]] = remain
+        return padded
 
     def _condition_latent_goal_with_action_intent(self, latent_goal, goal):
         action_intent = None
@@ -800,6 +889,8 @@ class VPP_Policy(pl.LightningModule):
         if action_intent.dim() == 2:
             action_intent = action_intent.unsqueeze(0)
         action_intent = action_intent.reshape(action_intent.shape[0], -1)
+        if action_intent.is_floating_point() and not torch.isfinite(action_intent).all():
+            return latent_goal
         if action_intent.shape[-1] != self.action_intent_dim:
             raise ValueError(f"expected flattened action_intent dim {self.action_intent_dim}, got {action_intent.shape[-1]}")
         action_intent = self.action_intent_proj(action_intent).unsqueeze(1)
@@ -824,6 +915,8 @@ class VPP_Policy(pl.LightningModule):
         if action_intent.dim() == 2:
             action_intent = action_intent.unsqueeze(0)
         action_intent = action_intent.reshape(action_intent.shape[0], -1)
+        if action_intent.is_floating_point() and not torch.isfinite(action_intent).all():
+            return None
         if action_intent.shape[-1] != self.action_intent_dim:
             raise ValueError(f"expected flattened action_intent dim {self.action_intent_dim}, got {action_intent.shape[-1]}")
         action_intent = self.action_intent_proj(action_intent).unsqueeze(1)
@@ -836,6 +929,44 @@ class VPP_Policy(pl.LightningModule):
         """
         Method for doing inference with the model.
         """
+        debug_nan = os.environ.get("DEFI_DEBUG_NAN", "0") == "1"
+
+        def _debug_tensor(name, value):
+            if not debug_nan:
+                return
+            if isinstance(value, dict):
+                for key, tensor in value.items():
+                    if torch.is_tensor(tensor):
+                        _debug_tensor(f"{name}.{key}", tensor)
+                return
+            if not torch.is_tensor(value):
+                return
+            finite = torch.isfinite(value).all().item() if value.is_floating_point() else True
+            print(f"[VPP_NAN] {name}: shape={tuple(value.shape)} dtype={value.dtype} finite={finite}", flush=True)
+            if value.is_floating_point():
+                detached = value.detach()
+                finite_values = detached[torch.isfinite(detached)]
+                if finite_values.numel() > 0:
+                    min_value = float(finite_values.min())
+                    max_value = float(finite_values.max())
+                else:
+                    min_value = float("nan")
+                    max_value = float("nan")
+                print(
+                    f"[VPP_NAN] {name}: minmax={min_value} {max_value}",
+                    flush=True,
+                )
+            if not finite:
+                raise FloatingPointError(f"non-finite tensor in VPP eval_forward: {name}")
+
+        def _finite_or_zero(name, value):
+            if not torch.is_tensor(value) or not value.is_floating_point():
+                return value
+            if torch.isfinite(value).all():
+                return value
+            print(f"[VPP_NAN_GUARD] replacing non-finite tensor: {name}", flush=True)
+            return torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+
         lang_text = goal["lang_text"]
         if isinstance(lang_text, tuple):
             lang_text = list(lang_text)
@@ -847,8 +978,13 @@ class VPP_Policy(pl.LightningModule):
             else:
                 latent_goal = self.language_goal(goal["lang"]).unsqueeze(0).to(torch.float32).to(
                     obs["rgb_obs"]['rgb_static'].device)
+            latent_goal = _finite_or_zero("latent_goal.raw", latent_goal)
             latent_goal = self._condition_latent_goal_with_action_intent(latent_goal, goal)
+            latent_goal = _finite_or_zero("latent_goal.conditioned", latent_goal)
             action_intent_cond = self._project_action_intent_condition(goal, latent_goal.device, latent_goal.dtype)
+            action_intent_cond = _finite_or_zero("action_intent_cond", action_intent_cond)
+            _debug_tensor("latent_goal", latent_goal)
+            _debug_tensor("action_intent_cond", action_intent_cond)
 
         rgb_static = obs["rgb_obs"]['rgb_static']  # torch.Size([28, 1, 3, 256, 256])
         rgb_gripper = obs["rgb_obs"]['rgb_gripper']  # torch.Size([28, 1, 3, 256, 256])
@@ -870,6 +1006,8 @@ class VPP_Policy(pl.LightningModule):
             perceptual_features = self.TVP_encoder(input_rgb, language, self.timestep,  # torch.Size([56, 16, 2560, 16, 16])
                                                            self.extract_layer_idx, all_layer=self.use_all_layer,
                                                            step_time=1, max_length=self.max_length)
+            perceptual_features = _finite_or_zero("tvp_perceptual_features", perceptual_features)
+            _debug_tensor("tvp_perceptual_features", perceptual_features)
         
         # 这里将两个视角的图像按batch维度拼接在一起, 过TVP, 然后再按channel维度拼接在一起
 
@@ -889,19 +1027,30 @@ class VPP_Policy(pl.LightningModule):
         perceptual_features_for_videoformer = perceptual_features_for_videoformer.to(torch.float32)
 
         perceptual_features = perceptual_features.to(torch.float32)
+        perceptual_features_for_videoformer = _finite_or_zero(
+            "perceptual_features_for_videoformer",
+            perceptual_features_for_videoformer,
+        )
+        perceptual_features = _finite_or_zero("perceptual_features", perceptual_features)
 
         # TODO 在这儿改frame, eval过程
         frame_0 = perceptual_features[:, 0]      # shape: [28, 256, 2560]
         frame_5 = perceptual_features[:, 0+5]      # shape: [28, 256, 2560]
         perceptual_features = torch.stack([frame_0, frame_5], dim=1)  # shape [28, 2, 256, 2560]
         perceptual_features = self.goal_emb(perceptual_features)  # torch.Size([28, 2, 256, 1024])
+        perceptual_features = _finite_or_zero("goal_emb_features", perceptual_features)
+        _debug_tensor("goal_emb_features", perceptual_features)
         time_pos_emb = (
             self.time_pos_emb.unsqueeze(0).expand(perceptual_features.size(0), -1, -1, -1)
         )  # torch.Size([28, 2, 1, 384])
         perceptual_features = perceptual_features + time_pos_emb  # torch.Size([28, 2, 512, 384])
+        perceptual_features = _finite_or_zero("goal_emb_plus_time", perceptual_features)
+        _debug_tensor("goal_emb_plus_time", perceptual_features)
 
         # 2.1 Video Former
         perceptual_features_for_videoformer = self.Video_Former(perceptual_features_for_videoformer)  # torch.Size([28, 224, 384])
+        perceptual_features_for_videoformer = _finite_or_zero("video_former_features", perceptual_features_for_videoformer)
+        _debug_tensor("video_former_features", perceptual_features_for_videoformer)
         if self.use_Former == 'linear':  # False
             perceptual_features = rearrange(perceptual_features, 'b T q d -> b (T q) d')
 
@@ -918,7 +1067,15 @@ class VPP_Policy(pl.LightningModule):
                 perceptual_emb['state_images'],
                 lang_text,  # UniVLA stage 1 need to add, while stage 2 not need
             )
+            if isinstance(univla_out, dict):
+                univla_out = {
+                    key: _finite_or_zero(f"lam_output.{key}", tensor)
+                    for key, tensor in univla_out.items()
+                }
+            _debug_tensor("lam_output", univla_out)
             latent_motion_tokens_up = univla_out['video_action_patches'].squeeze(1)
+            latent_motion_tokens_up = _finite_or_zero("latent_motion_tokens_up", latent_motion_tokens_up)
+            _debug_tensor("latent_motion_tokens_up", latent_motion_tokens_up)
             perceptual_emb['state_images'] = perceptual_emb['state_images'].reshape(
                 perceptual_emb['state_images'].size(0), -1, perceptual_emb['state_images'].size(-1)
             )
@@ -930,6 +1087,8 @@ class VPP_Policy(pl.LightningModule):
                 action_intent_cond=action_intent_cond,
                 inference=True,
             )
+            act_seq = _finite_or_zero("act_seq", act_seq)
+            _debug_tensor("act_seq", act_seq)
         return act_seq  # torch.Size([28, 10, 7])
 
     def step(self, obs, goal):  # This is used when rollouting in inference.
