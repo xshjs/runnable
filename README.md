@@ -155,6 +155,53 @@ scripts/rollout_calvin.sh
 
 The following commands are additive examples for the current X5 real-robot setup. They do not replace the original Stage 1/2/3 pipeline above.
 
+## CALVIN Joint-Belief Suffix Rollout
+
+For the current no-retry CALVIN rollout, use the packaged conservative runner:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi
+
+NUM_SEQUENCES=1000 \
+bash Step3_DeFI/scripts/run_calvin_joint_belief_suffix.sh
+```
+
+This runner uses the verified Step3 checkpoint and the factored joint-belief/action transition checkpoint:
+
+- policy checkpoint: `/mnt/workspace/manipulation/DeFi/outputs/collect_step3_action_chunk_phi_1000_sanitize/train_folder/saved_models/step3_defi.pt`
+- transition checkpoint: `/mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt`
+- action-intent generator: `/mnt/workspace/manipulation/BridgeVLA/eval/joint_action_generator_mlp_d300_abc700_abc1500_v2/joint_action_generator_mlp.pt`
+
+The default controller is intentionally conservative:
+
+- no retry: `--disable_retry_after_first_pass`
+- first-pass joint belief enabled: `--dynamic_coupling_first_pass`
+- no replan: `--dynamic_coupling_disable_replan`
+- `z_a` is maintained inside the persistent joint hypothesis, but is not injected into the policy decoder
+- suffix patch threshold: `patch_prob >= 0.55` and `patch_prob >= keep_prob + 0.10`
+- suffix patch mix: `0.02`
+
+To run a shorter smoke test:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi
+
+NUM_SEQUENCES=20 \
+bash Step3_DeFI/scripts/run_calvin_joint_belief_suffix.sh
+```
+
+To slightly adjust conservativeness without editing code:
+
+```bash
+cd /mnt/workspace/manipulation/DeFi
+
+NUM_SEQUENCES=1000 \
+JOINT_BELIEF_CLEAN_PATCH_MIN_PROB=0.55 \
+JOINT_BELIEF_CLEAN_PATCH_MARGIN=0.10 \
+DYNAMIC_COUPLING_DELTA_ACTION_REPAIR_MIX=0.02 \
+bash Step3_DeFI/scripts/run_calvin_joint_belief_suffix.sh
+```
+
 ### Convert processed X5 data
 
 Convert the processed `cups` LeRobot-style data into DeFi npz format. The current joint-action setup keeps `action[:7]` directly, including the continuous gripper value.
