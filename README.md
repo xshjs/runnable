@@ -365,6 +365,7 @@ transition_memory_keep_patch_replan_s1024.npz     balanced training memory
 transition_memory_keep_patch_replan_s1024.json    memory construction summary
 train_summary.json                                recorded training summary
 train_log.jsonl                                   recorded training log
+raw_trace_sample/                                 10 raw rollout rows and npz traces for audit
 ```
 
 The published balanced memory was assembled from the keep-heavy baseline-shadow memory and the delta memory with non-zero action suffix targets:
@@ -468,6 +469,20 @@ state_end              float32 [3000, 39]
 task_vec               float32 [3000, 128]
 mode_label             int64   [3000]
 success                float32 [3000]
+```
+
+A small raw trace sample is also included for auditing the conversion from rollout rows to compact memory:
+
+```text
+/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/raw_trace_sample/
+```
+
+It contains:
+
+```text
+joint_belief_transition_rows_sample10.jsonl       10 raw row records
+joint_belief_transition/row_0000000.npz ...       raw per-step trace npz files
+README_raw_trace_sample.json                      field meanings and example shapes
 ```
 
 A quick validation command:
