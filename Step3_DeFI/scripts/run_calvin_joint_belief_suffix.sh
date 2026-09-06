@@ -23,7 +23,7 @@ T5_MODEL_PATH="${T5_MODEL_PATH:-/mnt/workspace/manipulation/DeFi/ckpts/t5_base}"
 LANGUAGE_GOAL_PATH="${LANGUAGE_GOAL_PATH:-/mnt/workspace/manipulation/DeFi/ckpts/ViT-B-32.pt}"
 CALVIN_ABC_DIR="${CALVIN_ABC_DIR:-/mnt/workspace/calvin/task_ABC_D}"
 EVAL_SEQUENCES_PATH="${EVAL_SEQUENCES_PATH:-/mnt/workspace/manipulation/DeFi/outputs/splits/outcome_router_clean_1k_train1000.json}"
-JOINT_BELIEF_TRANSITION_CKPT="${JOINT_BELIEF_TRANSITION_CKPT:-/mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt}"
+JOINT_BELIEF_TRANSITION_CKPT="${JOINT_BELIEF_TRANSITION_CKPT:-/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_transition.pt}"
 JOINT_PAIR_ACTION_GENERATOR_CKPT="${JOINT_PAIR_ACTION_GENERATOR_CKPT:-/mnt/workspace/manipulation/BridgeVLA/eval/joint_action_generator_mlp_d300_abc700_abc1500_v2/joint_action_generator_mlp.pt}"
 
 # Conservative suffix defaults from the Sep 3 no-retry run:

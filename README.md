@@ -169,7 +169,7 @@ bash Step3_DeFI/scripts/run_calvin_joint_belief_suffix.sh
 This runner uses the verified Step3 checkpoint and the factored joint-belief/action transition checkpoint:
 
 - policy checkpoint: `/mnt/workspace/manipulation/DeFi/outputs/collect_step3_action_chunk_phi_1000_sanitize/train_folder/saved_models/step3_defi.pt`
-- transition checkpoint: `/mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt`
+- transition checkpoint: `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_transition.pt`
 - action-intent generator: `/mnt/workspace/manipulation/BridgeVLA/eval/joint_action_generator_mlp_d300_abc700_abc1500_v2/joint_action_generator_mlp.pt`
 
 The default controller is intentionally conservative:
@@ -244,6 +244,12 @@ The current ablation runner supports the normal CALVIN setting. Perturbation set
 ### Reproduce `factored_belief_action_with_za_balanced_v1`
 
 This checkpoint is the CALVIN factored transition/action-adaptation model used by the joint-belief suffix controller:
+
+```text
+/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_transition.pt
+```
+
+The local training output copy is:
 
 ```text
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt
@@ -420,9 +426,10 @@ The local training artifacts are:
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/summary.json
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/train_log.jsonl
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt
+/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_transition.pt
 ```
 
-The model checkpoint is about 26 MB and the balanced memory npz is about 12 MB, so they are not committed to git by default. Put them under the same paths above, or override `JOINT_BELIEF_TRANSITION_CKPT` in the rollout scripts.
+The model checkpoint is about 26 MB and the balanced memory npz is about 12 MB, so they are not committed to git by default. The shared checkpoint copy is expected at `/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_transition.pt`; otherwise override `JOINT_BELIEF_TRANSITION_CKPT` in the rollout scripts.
 
 #### 5. Minimal memory sample for sanity checking
 

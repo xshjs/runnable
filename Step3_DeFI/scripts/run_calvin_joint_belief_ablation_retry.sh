@@ -25,7 +25,7 @@ EVAL_SEQUENCES_PATH="${EVAL_SEQUENCES_PATH:-/mnt/workspace/manipulation/white_se
 
 DELTA_ACTION_REPAIR_CKPT="${DELTA_ACTION_REPAIR_CKPT:-/mnt/workspace/manipulation/DeFi/outputs/delta_action_repair_v5_balanced/train_run/delta_action_repair_mlp.pt}"
 CHUNK_EFFECT_CKPT="${CHUNK_EFFECT_CKPT:-/mnt/workspace/manipulation/DeFi/outputs/phi_chunk_effect_v4/train_run_s1024_balanced_seq934/chunk_effect_phi_mlp.pt}"
-JOINT_BELIEF_TRANSITION_CKPT="${JOINT_BELIEF_TRANSITION_CKPT:-/mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt}"
+JOINT_BELIEF_TRANSITION_CKPT="${JOINT_BELIEF_TRANSITION_CKPT:-/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_transition.pt}"
 JOINT_PAIR_ACTION_GENERATOR_CKPT="${JOINT_PAIR_ACTION_GENERATOR_CKPT:-/mnt/workspace/manipulation/BridgeVLA/eval/joint_action_generator_mlp_d300_abc700_abc1500_v2/joint_action_generator_mlp.pt}"
 
 PATCH_MIN_PROB="${PATCH_MIN_PROB:-0.40}"
