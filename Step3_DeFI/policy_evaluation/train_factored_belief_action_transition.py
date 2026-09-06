@@ -44,15 +44,51 @@ class BeliefTransitionMLP(nn.Module):
         return self.net(x)
 
 
+class ExpectedTransitionMLP(nn.Module):
+    """F_phi: h_t,o_t,a_t,task -> expected h_{t+1}; intentionally cannot see o_{t+1}."""
+
+    def __init__(self, state_dim: int, summary_dim: int, action_dim: int, task_dim: int, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.state_dim = int(state_dim)
+        self.summary_dim = int(summary_dim)
+        self.action_dim = int(action_dim)
+        self.task_dim = int(task_dim)
+        in_dim = state_dim + summary_dim + action_dim + task_dim + 3
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, summary_dim),
+        )
+
+    def forward(self, h_t: torch.Tensor, state_t: torch.Tensor, action_t: torch.Tensor, task_vec: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([h_t, state_t, action_t, task_vec, meta], dim=-1)
+        return self.net(x)
+
+
 class ActionAdaptationMLP(nn.Module):
     """D_theta: A_remain,h_t,h_{t+1} -> delta_A and learned mode."""
 
-    def __init__(self, summary_dim: int, action_dim: int, chunk_len: int, task_dim: int, hidden_dim: int, dropout: float):
+    def __init__(
+        self,
+        summary_dim: int,
+        action_dim: int,
+        chunk_len: int,
+        task_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        adaptation_input: str = "ht_hnext",
+    ):
         super().__init__()
         self.summary_dim = int(summary_dim)
         self.action_dim = int(action_dim)
         self.chunk_len = int(chunk_len)
         self.task_dim = int(task_dim)
+        self.adaptation_input = str(adaptation_input)
         in_dim = summary_dim * 2 + chunk_len * action_dim + task_dim + 3
         self.trunk = nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -67,8 +103,22 @@ class ActionAdaptationMLP(nn.Module):
         self.mode_head = nn.Linear(hidden_dim, 3)  # keep, patch, replan
         self.confidence_head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, action_remain: torch.Tensor, h_t: torch.Tensor, h_tp1: torch.Tensor, task_vec: torch.Tensor, meta: torch.Tensor) -> dict[str, torch.Tensor]:
-        x = torch.cat([action_remain.reshape(action_remain.shape[0], -1), h_t, h_tp1, task_vec, meta], dim=-1)
+    def forward(
+        self,
+        action_remain: torch.Tensor,
+        h_t: torch.Tensor,
+        h_tp1: torch.Tensor,
+        task_vec: torch.Tensor,
+        meta: torch.Tensor,
+        h_expected: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if self.adaptation_input == "post_innovation":
+            if h_expected is None:
+                h_expected = h_t
+            belief_context = torch.cat([h_tp1, h_tp1 - h_expected], dim=-1)
+        else:
+            belief_context = torch.cat([h_t, h_tp1], dim=-1)
+        x = torch.cat([action_remain.reshape(action_remain.shape[0], -1), belief_context, task_vec, meta], dim=-1)
         y = self.trunk(x)
         return {
             "action_delta": self.delta_head(y).reshape(action_remain.shape[0], self.chunk_len, self.action_dim),
@@ -139,29 +189,50 @@ def gather(bank: dict[str, np.ndarray], ids: np.ndarray, device: torch.device) -
     return out
 
 
-def run_models(t_model: BeliefTransitionMLP, d_model: ActionAdaptationMLP, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+def run_models(
+    t_model: BeliefTransitionMLP,
+    d_model: ActionAdaptationMLP,
+    batch: dict[str, torch.Tensor],
+    f_model: ExpectedTransitionMLP | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, dict[str, torch.Tensor]]:
     pred_delta_h = t_model(batch["h_t"], batch["state_start"], batch["executed_action"], batch["state_end"], batch["task_vec"], batch["meta"])
     pred_h_tp1 = batch["h_t"] + pred_delta_h
-    d_out = d_model(batch["action_chunk"], batch["h_t"], pred_h_tp1, batch["task_vec"], batch["meta"])
-    return pred_delta_h, d_out
+    expected_delta_h = None
+    pred_h_expected = None
+    if f_model is not None:
+        expected_delta_h = f_model(batch["h_t"], batch["state_start"], batch["executed_action"], batch["task_vec"], batch["meta"])
+        pred_h_expected = batch["h_t"] + expected_delta_h
+    d_out = d_model(batch["action_chunk"], batch["h_t"], pred_h_tp1, batch["task_vec"], batch["meta"], h_expected=pred_h_expected)
+    return pred_delta_h, expected_delta_h, pred_h_tp1, d_out
 
 
-def eval_models(t_model: BeliefTransitionMLP, d_model: ActionAdaptationMLP, bank: dict[str, np.ndarray], ids: np.ndarray, device: torch.device, batch_size: int) -> dict[str, Any]:
+def eval_models(t_model: BeliefTransitionMLP, d_model: ActionAdaptationMLP, bank: dict[str, np.ndarray], ids: np.ndarray, device: torch.device, batch_size: int, f_model: ExpectedTransitionMLP | None = None, expected_loss_weight: float = 0.5) -> dict[str, Any]:
     t_model.eval()
     d_model.eval()
+    if f_model is not None:
+        f_model.eval()
     vals: dict[str, list[torch.Tensor]] = {"loss": [], "belief_l1": [], "action_l1": [], "mode_acc": [], "confidence_l1": []}
+    if f_model is not None:
+        vals["expected_l1"] = []
+        vals["innovation_l1"] = []
     with torch.no_grad():
         for start in range(0, ids.size, batch_size):
             batch = gather(bank, ids[start : start + batch_size], device)
-            pred_delta_h, d_out = run_models(t_model, d_model, batch)
+            pred_delta_h, expected_delta_h, pred_h_tp1, d_out = run_models(t_model, d_model, batch, f_model=f_model)
             belief_loss = F.smooth_l1_loss(pred_delta_h, batch["belief_delta"])
+            expected_loss = torch.zeros_like(belief_loss)
+            if expected_delta_h is not None:
+                expected_loss = F.smooth_l1_loss(expected_delta_h, batch["belief_delta"])
             action_loss = F.smooth_l1_loss(d_out["action_delta"], batch["action_delta"])
             mode_loss = F.cross_entropy(d_out["mode_logits"], batch["mode"])
             conf_target = (batch["mode"] != 2).float()
             confidence_loss = F.binary_cross_entropy_with_logits(d_out["confidence_logit"], conf_target)
-            loss = belief_loss + 0.5 * action_loss + 0.1 * mode_loss + 0.05 * confidence_loss
+            loss = belief_loss + expected_loss_weight * expected_loss + 0.5 * action_loss + 0.1 * mode_loss + 0.05 * confidence_loss
             vals["loss"].append(loss.cpu())
             vals["belief_l1"].append(F.l1_loss(pred_delta_h, batch["belief_delta"]).cpu())
+            if expected_delta_h is not None:
+                vals["expected_l1"].append(F.l1_loss(expected_delta_h, batch["belief_delta"]).cpu())
+                vals["innovation_l1"].append(F.l1_loss(pred_delta_h - expected_delta_h, torch.zeros_like(pred_delta_h)).cpu())
             vals["action_l1"].append(F.l1_loss(d_out["action_delta"], batch["action_delta"]).cpu())
             vals["mode_acc"].append((d_out["mode_logits"].argmax(dim=-1) == batch["mode"]).float().mean().cpu())
             vals["confidence_l1"].append(F.l1_loss(d_out["confidence_logit"].sigmoid(), conf_target).cpu())
@@ -182,6 +253,9 @@ def main() -> None:
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--keep-delta-norm", type=float, default=0.02)
     parser.add_argument("--replan-delta-norm", type=float, default=0.0)
+    parser.add_argument("--expected-transition", action="store_true", help="Train F_phi without state_end and use posterior-expected innovation for D.")
+    parser.add_argument("--expected-loss-weight", type=float, default=0.5)
+    parser.add_argument("--adaptation-input", choices=["ht_hnext", "post_innovation"], default="ht_hnext")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -211,6 +285,16 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
     ).to(device)
+    f_model = None
+    if args.expected_transition:
+        f_model = ExpectedTransitionMLP(
+            state_dim=bank["state_start"].shape[-1],
+            summary_dim=bank["h_t"].shape[-1],
+            action_dim=bank["executed_action"].shape[-1],
+            task_dim=bank["task_vec"].shape[-1],
+            hidden_dim=args.hidden_dim,
+            dropout=args.dropout,
+        ).to(device)
     d_model = ActionAdaptationMLP(
         summary_dim=bank["h_t"].shape[-1],
         action_dim=bank["action_chunk"].shape[-1],
@@ -218,8 +302,12 @@ def main() -> None:
         task_dim=bank["task_vec"].shape[-1],
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        adaptation_input=("post_innovation" if args.expected_transition else args.adaptation_input),
     ).to(device)
-    opt = torch.optim.AdamW(list(t_model.parameters()) + list(d_model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
+    params = list(t_model.parameters()) + list(d_model.parameters())
+    if f_model is not None:
+        params += list(f_model.parameters())
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     rng = np.random.default_rng(args.seed)
     best: dict[str, Any] | None = None
     best_state = None
@@ -231,18 +319,32 @@ def main() -> None:
             batch = gather(bank, ids, device)
             t_model.train()
             d_model.train()
-            pred_delta_h, d_out = run_models(t_model, d_model, batch)
+            if f_model is not None:
+                f_model.train()
+            pred_delta_h, expected_delta_h, pred_h_tp1, d_out = run_models(t_model, d_model, batch, f_model=f_model)
             belief_loss = F.smooth_l1_loss(pred_delta_h, batch["belief_delta"])
+            expected_loss = torch.zeros_like(belief_loss)
+            if expected_delta_h is not None:
+                expected_loss = F.smooth_l1_loss(expected_delta_h, batch["belief_delta"])
             action_loss = F.smooth_l1_loss(d_out["action_delta"], batch["action_delta"])
             mode_loss = F.cross_entropy(d_out["mode_logits"], batch["mode"])
             conf_target = (batch["mode"] != 2).float()
             confidence_loss = F.binary_cross_entropy_with_logits(d_out["confidence_logit"], conf_target)
-            loss = belief_loss + 0.5 * action_loss + 0.1 * mode_loss + 0.05 * confidence_loss
+            loss = belief_loss + float(args.expected_loss_weight) * expected_loss + 0.5 * action_loss + 0.1 * mode_loss + 0.05 * confidence_loss
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             if step == 1 or step % 200 == 0 or step == args.steps:
-                metrics = eval_models(t_model, d_model, bank, val_ids, device, args.eval_batch_size)
+                metrics = eval_models(
+                    t_model,
+                    d_model,
+                    bank,
+                    val_ids,
+                    device,
+                    args.eval_batch_size,
+                    f_model=f_model,
+                    expected_loss_weight=float(args.expected_loss_weight),
+                )
                 metrics.update({"step": int(step), "train_loss": float(loss.item())})
                 log_f.write(json.dumps(metrics) + "\n")
                 log_f.flush()
@@ -252,17 +354,24 @@ def main() -> None:
                         "t_model": {k: v.detach().cpu() for k, v in t_model.state_dict().items()},
                         "d_model": {k: v.detach().cpu() for k, v in d_model.state_dict().items()},
                     }
+                    if f_model is not None:
+                        best_state["f_model"] = {k: v.detach().cpu() for k, v in f_model.state_dict().items()}
                 print(json.dumps(metrics), flush=True)
 
     if best_state is not None:
         t_model.load_state_dict(best_state["t_model"])
         d_model.load_state_dict(best_state["d_model"])
+        if f_model is not None and "f_model" in best_state:
+            f_model.load_state_dict(best_state["f_model"])
     ckpt_path = args.output_dir / "factored_belief_action_transition.pt"
     torch.save(
         {
             "runtime_type": "factored_belief_action_transition",
             "t_model_state": t_model.state_dict(),
             "d_model_state": d_model.state_dict(),
+            "f_model_state": f_model.state_dict() if f_model is not None else None,
+            "has_expected_transition": bool(f_model is not None),
+            "adaptation_input": str(d_model.adaptation_input),
             "state_dim": int(bank["state_start"].shape[-1]),
             "summary_dim": int(bank["h_t"].shape[-1]),
             "action_dim": int(bank["action_chunk"].shape[-1]),
@@ -281,6 +390,8 @@ def main() -> None:
         "num_train": int(train_ids.size),
         "num_val": int(val_ids.size),
         "mode_counts": {str(k): int(v) for k, v in zip(*np.unique(bank["mode"], return_counts=True))},
+        "has_expected_transition": bool(f_model is not None),
+        "adaptation_input": str(d_model.adaptation_input),
         "steps": int(args.steps),
         "best": best,
         "output_ckpt": str(ckpt_path),
