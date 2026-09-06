@@ -350,7 +350,24 @@ Action values use the same normalized CALVIN action convention as Step3 DeFI: fi
 
 #### 3. Balance keep / patch / replan samples
 
-The published `factored_belief_action_with_za_balanced_v1` memory was assembled from a keep-heavy baseline-shadow memory and a delta memory with non-zero action suffix targets:
+The shared data bundle for `factored_belief_action_with_za_balanced_v1` is stored with the 0824 pen assets:
+
+```text
+/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/
+```
+
+It contains:
+
+```text
+keep_memory_s1024_sample3000.npz                  source keep-heavy memory
+delta_memory_15_11_s1024.npz                      source non-zero suffix-delta memory
+transition_memory_keep_patch_replan_s1024.npz     balanced training memory
+transition_memory_keep_patch_replan_s1024.json    memory construction summary
+train_summary.json                                recorded training summary
+train_log.jsonl                                   recorded training log
+```
+
+The published balanced memory was assembled from the keep-heavy baseline-shadow memory and the delta memory with non-zero action suffix targets:
 
 ```bash
 cd /mnt/workspace/manipulation/DeFi
@@ -358,10 +375,10 @@ cd /mnt/workspace/manipulation/DeFi
 PYTHONPATH=/mnt/workspace/manipulation/DeFi/Step3_DeFI \
 /mnt/data/xiyin/manipulation/DeFi/.venv/bin/python \
 Step3_DeFI/policy_evaluation/balance_factored_belief_action_memory.py \
-  --keep-npz /mnt/workspace/manipulation/DeFi/outputs/joint_belief_transition_collect_100_with_za/joint_belief_transition_memory_s1024_sample3000.npz \
-  --delta-npz /mnt/workspace/manipulation/DeFi/outputs/joint_belief_transition_v3_from_rollout/transition_memory_15_11_s1024.npz \
-  --output-npz /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/transition_memory_keep_patch_replan_s1024.npz \
-  --summary-json /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/transition_memory_keep_patch_replan_s1024.json \
+  --keep-npz /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/keep_memory_s1024_sample3000.npz \
+  --delta-npz /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/delta_memory_15_11_s1024.npz \
+  --output-npz /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/transition_memory_keep_patch_replan_s1024.npz \
+  --summary-json /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/transition_memory_keep_patch_replan_s1024.json \
   --num-keep 1500 \
   --num-patch 750 \
   --num-replan 750 \
@@ -392,7 +409,7 @@ cd /mnt/workspace/manipulation/DeFi
 PYTHONPATH=/mnt/workspace/manipulation/DeFi/Step3_DeFI \
 /mnt/data/xiyin/manipulation/DeFi/.venv/bin/python \
 Step3_DeFI/policy_evaluation/train_factored_belief_action_transition.py \
-  --memory-npz /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/transition_memory_keep_patch_replan_s1024.npz \
+  --memory-npz /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/transition_memory_keep_patch_replan_s1024.npz \
   --output-dir /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run \
   --hidden-dim 1024 \
   --steps 3000 \
@@ -423,6 +440,10 @@ The recorded training output was:
 The local training artifacts are:
 
 ```text
+/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/train_summary.json
+/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/train_log.jsonl
+/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/transition_memory_keep_patch_replan_s1024.npz
+/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/transition_memory_keep_patch_replan_s1024.json
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/summary.json
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/train_log.jsonl
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt
@@ -456,7 +477,7 @@ cd /mnt/workspace/manipulation/DeFi
 
 /mnt/data/xiyin/manipulation/DeFi/.venv/bin/python - <<'PY'
 import numpy as np
-p = "/mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/transition_memory_keep_patch_replan_s1024.npz"
+p = "/mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_repro/transition_memory_keep_patch_replan_s1024.npz"
 with np.load(p, allow_pickle=True) as d:
     for k in ["state_start", "executed_action", "base_summary_exec", "target_summary_exec", "action_chunk", "action_delta_target", "mode_label"]:
         print(k, d[k].shape, d[k].dtype, "finite=", np.isfinite(d[k]).all() if d[k].dtype.kind in "fiu" else "n/a")
