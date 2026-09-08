@@ -628,7 +628,7 @@ CALVIN joint-belief suffix checkpoint:
 /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_transition.pt
 ```
 
-Local source:
+This shared copy is the default runnable/deployment path. It was copied from the local training output:
 
 ```text
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt

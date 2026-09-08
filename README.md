@@ -266,7 +266,7 @@ This checkpoint is the CALVIN factored transition/action-adaptation model used b
 /mnt/data/shared/hxw/x5_left_pen_tape_cutter_tray_0824_1403/factored_belief_action_transition.pt
 ```
 
-The local training output copy is:
+This shared copy is the default deployment path used by the runnable scripts. It was copied from the local training output:
 
 ```text
 /mnt/workspace/manipulation/DeFi/outputs/factored_belief_action_with_za_balanced_v1/train_run/factored_belief_action_transition.pt
