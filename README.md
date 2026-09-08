@@ -241,6 +241,22 @@ MODE=all
 
 The current ablation runner supports the normal CALVIN setting. Perturbation settings and 2/4/6/8/10-step suffix-horizon binning should be run as a separate follow-up so the first comparison stays controlled.
 
+### RLBench Suffix Memory Repro Notes
+
+The provenance, label construction, temporal alignment assumptions, and non-zero
+delta examples for the RLBench suffix memory are documented in:
+
+```text
+Step3_DeFI/RLBENCH_SUFFIX_MEMORY_REPRO.md
+```
+
+The runnable repo also includes the key memory builder and BridgeVLA eval wrapper:
+
+```text
+Step3_DeFI/policy_evaluation/build_bridge_suffix_transition_memory.py
+Step3_DeFI/scripts/run_bridgevla_rlbench_suffix_td_eval.sh
+```
+
 ### Reproduce `factored_belief_action_with_za_balanced_v1`
 
 This checkpoint is the CALVIN factored transition/action-adaptation model used by the joint-belief suffix controller:

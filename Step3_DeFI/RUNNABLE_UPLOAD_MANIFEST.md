@@ -42,9 +42,11 @@ These files are the core changes for real-robot dataset conversion, training, va
 - `Step3_DeFI/scripts/convert_defi_rel_action_to_x5_ee.py`
 - `Step3_DeFI/scripts/convert_defi_rel_action_to_x5_joint.py`
 - `Step3_DeFI/scripts/export_x5_action_from_ckpt.py`
+- `Step3_DeFI/scripts/run_bridgevla_rlbench_suffix_td_eval.sh`
 - `Step3_DeFI/scripts/train_calvin.py`
 - `Step3_DeFI/scripts/train_calvin_real_robot.sh`
 - `Step3_DeFI/policy_conf/VPP_Calvinabc_train.yaml`
+- `Step3_DeFI/policy_evaluation/build_bridge_suffix_transition_memory.py`
 - `Step3_DeFI/policy_models/VPP_policy.py`
 - `Step3_DeFI/policy_models/datasets/disk_dataset.py`
 - `Step3_DeFI/policy_models/edm_diffusion/gc_sampling.py`
@@ -54,6 +56,7 @@ These files are the core changes for real-robot dataset conversion, training, va
 - `Step3_DeFI/policy_models/utils/x5_action_conversion.py`
 - `Step3_DeFI/policy_models/utils/utils.py`
 - `Step3_DeFI/README_BASELINE_RUNNABLE.md`
+- `Step3_DeFI/RLBENCH_SUFFIX_MEMORY_REPRO.md`
 
 ## What these changes do
 
@@ -75,6 +78,12 @@ These files are the core changes for real-robot dataset conversion, training, va
   - raw normalized chunk
   - EE delta chunk
   - joint delta chunk
+- RLBench suffix-memory repro documentation and code:
+  - source rollout rows
+  - keep/patch label construction
+  - action suffix target alignment
+  - non-zero delta examples
+  - current proxy-supervision limitations
 
 ## Current training config behavior
 
