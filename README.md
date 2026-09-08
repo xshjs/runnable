@@ -243,8 +243,9 @@ The current ablation runner supports the normal CALVIN setting. Perturbation set
 
 ### RLBench Suffix Memory Repro Notes
 
-The provenance, label construction, temporal alignment assumptions, and non-zero
-delta examples for the RLBench suffix memory are documented in:
+The provenance, label construction, temporal alignment assumptions, non-zero
+delta examples, T/D inputs, action units, runtime patch limits, and deployment
+configuration for the RLBench suffix memory are documented in:
 
 ```text
 Step3_DeFI/RLBENCH_SUFFIX_MEMORY_REPRO.md
